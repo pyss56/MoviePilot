@@ -1,0 +1,306 @@
+name: MoviePilot Builder v3 (LAN Gitea)
+
+# Gitea Actions 专用工作流（Gitea 只读取 .gitea/workflows，不读取 .github/workflows）：
+#   - 克隆代码、登录 registry、推送镜像全部走内网 Gitea（地址见 GITEA_HOST / REGISTRY）
+#   - 不依赖任何 github.com 上的 Action，也不访问 github.com 拉代码
+#   - Dockerfile 中被构建时下载的 GitHub 产物（前端 dist.zip / 插件 / 站点资源 / uv / rclone）
+#     通过构建参数走内网代理或内网镜像地址，可用仓库 Secrets 覆盖：
+#       BUILD_PROXY          构建期 HTTP/HTTPS 代理（默认 http://10.3.3.15:20172，填 none 表示不使用）
+#                            代理服务与 runner 同机（NAS，局域网 10.3.3.15，另有公网映射域名），
+#                            内网一律走 IP：域名要经路由器回环（hairpin），多一跳且依赖 DNS
+#       BASE_IMAGE           基础镜像地址（默认 python:3.12.13-slim-bookworm）
+#       FFMPEG_IMAGE         静态 ffmpeg 镜像地址（默认 mwader/static-ffmpeg:8.1.1；内网镜像站可能不含该镜像，见下方嗅探步骤）
+#                            所有镜像源都不可用时，自动从国内 npmmirror 取 ffmpeg-static 二进制本地合成该镜像
+#       FRONTEND_DIST_URL    前端 dist.zip 直链（默认由 version.py 的 FRONTEND_VERSION 拼 GitHub 地址）
+#       PLUGINS_ARCHIVE_URL  插件包 zip 地址（默认 GitHub MoviePilot-Plugins main.zip，需保持内部目录名）
+#       RESOURCES_RAW_BASE   站点资源目录地址（默认 GitHub MoviePilot-Resources resources.v2）
+#       REGISTRY_USERNAME / REGISTRY_PASSWORD  registry 账号（默认回退 runner 注入的 token）
+on:
+  push:
+    branches:
+      - v3
+    tags:
+      - 'v3*'
+  workflow_dispatch:
+
+# 注意：不要加 concurrency + cancel-in-progress。
+# Gitea 1.27 下它会把新触发的 run 直接取消（job 还没被 runner 接走就 cancelled），表现为推送后"秒失败"。
+
+env:
+  # 私有域名一律不落仓库：GITEA_HOST（内网 Gitea 主机名）与 REGISTRY（容器 registry 地址，
+  # 通常与 GITEA_HOST 相同）由仓库 Secret 注入，见第一步 "Load private config"。
+  # 需在 仓库 Settings → Actions → Secrets 配置这两个同名 Secret，否则第一步会直接报错退出。
+  GITEA_REPO: pyss56/MoviePilot
+  # 镜像名（对应 moviepilot-v3:latest 这个引用）。Gitea 的 container registry 强制
+  # <owner>/<image> 两段路径，单段名会被拒绝，故保留 owner 段；
+  # 完整引用为 ${REGISTRY}/${IMAGE_NAME}:latest
+  IMAGE_NAME: pyss56/moviepilot-v3
+  # 代理服务就跑在 runner 主机（NAS）上，内网直接用其局域网 IP，避免域名经路由器回环
+  DEFAULT_BUILD_PROXY: http://10.3.3.15:20172
+  # 静态 ffmpeg 镜像：daocloud 镜像站有允许清单，mwader/static-ffmpeg 不在其中（403 DENIED），
+  # 因此按 FFMPEG_MIRRORS 顺序探测，取第一个能拉下来的镜像站（实测 1ms.run / rat.dev 可用）
+  DEFAULT_FFMPEG_IMAGE: mwader/static-ffmpeg:8.1.1
+  FFMPEG_MIRRORS: docker.1ms.run hub.rat.dev docker.xuanyuan.me docker.1panel.live
+  # 构建期软件源：同一局域网实测，经 20172 代理只有 4~6 KB/s（apt 5.7K / pypi 4.1K），
+  # 而直连阿里云镜像有 190~220 KB/s。apt 与 pip 一律切国内源，并加入 NO_PROXY 禁止走代理
+  DEFAULT_APT_MIRROR: mirrors.aliyun.com
+  DEFAULT_PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+  # 兜底静态 ffmpeg 来源：npmmirror 镜像的 npm ffmpeg-static 二进制（Linux x64 静态构建，含 amr）
+  # 只在所有 registry 都不可达时启用：HTTP 下载 → 本地 docker import 成 FFMPEG_IMAGE 同名镜像
+  FFMPEG_STATIC_BASE: https://registry.npmmirror.com/-/binary/ffmpeg-static
+  FFMPEG_STATIC_VERSION: b6.1.1
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load private config (私有配置注入)
+        # 私有域名不写进仓库：从仓库 Secret 读取，再通过 $GITHUB_ENV 透传给后续所有步骤
+        env:
+          SECRET_GITEA_HOST: ${{ secrets.GITEA_HOST }}
+          SECRET_REGISTRY: ${{ secrets.REGISTRY }}
+        run: |
+          if [ -z "${SECRET_GITEA_HOST}" ] || [ -z "${SECRET_REGISTRY}" ]; then
+            echo "缺少仓库 Secret：GITEA_HOST 与 REGISTRY（Settings → Actions → Secrets）" >&2
+            exit 1
+          fi
+          echo "GITEA_HOST=${SECRET_GITEA_HOST}" >> "$GITHUB_ENV"
+          echo "REGISTRY=${SECRET_REGISTRY}" >> "$GITHUB_ENV"
+          echo "私有配置已注入（值不回显）"
+
+      - name: Checkout (内网 Gitea 克隆)
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 工作区可能已被预置内容占用，先清空再克隆，避免 clone 到非空目录失败
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          git clone "https://oauth2:${GITEA_TOKEN}@${GITEA_HOST}/${GITEA_REPO}.git" .
+          git checkout "${GITHUB_SHA}"
+          git log --oneline -1
+
+      - name: Read version
+        run: |
+          APP_VERSION=$(sed -n "s/^APP_VERSION\s*=\s*'\([^']*\)'/\1/p" version.py)
+          if [ -z "$APP_VERSION" ]; then APP_VERSION=dev; fi
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          echo "SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_ENV
+          echo "BUILD_REF=${GITHUB_REF_NAME:-${GITHUB_REF}}" >> $GITHUB_ENV
+          echo "构建版本：${APP_VERSION}"
+
+      - name: Sync plugin market default (可选)
+        # 插件市场默认值实际只用到 MoviePilot-Wiki 的 plugin.md（默认分支 master，约 7KB）。
+        # 整仓 clone 走代理实测耗时 4 分钟以上，改为先抓单文件、失败再回退整仓 clone；失败不影响构建。
+        continue-on-error: true
+        env:
+          BUILD_PROXY: ${{ secrets.BUILD_PROXY }}
+        run: |
+          PROXY="${BUILD_PROXY:-${DEFAULT_BUILD_PROXY}}"
+          if [ "$PROXY" = "none" ]; then echo "已禁用代理，跳过插件市场同步"; exit 0; fi
+          WIKI=/tmp/mp-wiki/plugin.md
+          mkdir -p /tmp/mp-wiki
+          fetched=""
+          for branch in master main; do
+            if curl -fsSL -x "$PROXY" --max-time 60 \
+                 "https://raw.githubusercontent.com/jxxghp/MoviePilot-Wiki/${branch}/plugin.md" -o "$WIKI" \
+               && [ -s "$WIKI" ]; then
+              echo "已抓取 plugin.md（分支 ${branch}，$(wc -c < "$WIKI") 字节）"
+              fetched=1
+              break
+            fi
+          done
+          if [ -z "$fetched" ]; then
+            echo "单文件抓取失败，回退整仓 clone"
+            rm -rf /tmp/mp-wiki
+            git -c http.proxy="$PROXY" clone --depth 1 https://github.com/jxxghp/MoviePilot-Wiki.git /tmp/mp-wiki
+          fi
+          python3 -m scripts.generate_plugin_market_default \
+            --wiki-file "$WIKI" \
+            --config-file app/core/config.py || true
+
+      - name: Log in to Gitea container registry
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASS: ${{ secrets.REGISTRY_PASSWORD }}
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          USER="${REGISTRY_USER:-${GITHUB_ACTOR}}"
+          PASS="${REGISTRY_PASS:-${GITEA_TOKEN}}"
+          echo "$PASS" | docker login "$REGISTRY" -u "$USER" --password-stdin
+
+      - name: Resolve third-party images (镜像源嗅探)
+        # 内网镜像站未必收录全部镜像：daocloud 对 mwader/static-ffmpeg 返回 403 DENIED（不在允许清单），
+        # 且镜像站失败后 dockerd 会回退官方源 registry-1.docker.io，在墙内该域名被黑洞，
+        # 实测一次 pull 能卡十几分钟（远超 Go 默认握手超时），所以规范名这次尝试必须限时 90s。
+        # 这里按候选镜像站顺序试拉，首个成功者既作为构建参数，也用规范名再打一个 tag，
+        # 让 BuildKit（docker driver）直接命中本地镜像，不再回源拉取。
+        env:
+          FFMPEG_IMAGE: ${{ secrets.FFMPEG_IMAGE }}
+          BASE_IMAGE: ${{ secrets.BASE_IMAGE }}
+          BUILD_PROXY: ${{ secrets.BUILD_PROXY }}
+          NO_PROXY_EXTRA: ${{ secrets.NO_PROXY_EXTRA }}
+        run: |
+          PROXY="${BUILD_PROXY:-${DEFAULT_BUILD_PROXY}}"
+
+          resolve() {
+            ref="$1"; var="$2"
+            mirrors="${FFMPEG_MIRRORS}"
+            # 已是显式 registry 地址（host.tld/… 或 host:port/…）时不再套用镜像站前缀
+            case "$ref" in */*) case "${ref%%/*}" in *.*|*:*) mirrors="";; esac;; esac
+            # 本机（runner 宿主的 dockerd）已有该镜像就直接复用：docker pull 无论如何都要联网取 manifest，
+            # 而 BuildKit 的 FROM 命中本地镜像时不再回源；本仓库镜像 tag 都是固定版本，不存在标签漂移。
+            # 效果：只要成功构建过一次，之后的嗅探步骤就是零网络、秒过。
+            if docker image inspect "$ref" >/dev/null 2>&1; then
+              echo "[本地] 已存在 ${ref}，跳过拉取"
+              return 0
+            fi
+            for mirror in "" ${mirrors}; do
+              if [ -n "$mirror" ]; then
+                cand="${mirror}/${ref}"
+                # 镜像站要么几秒内出结果、要么直接挂死；原先 150s 让 5 个候选白等 12 分钟
+                limit=45
+              else
+                cand="${ref}"
+                # 规范名走 daemon 网络：失败会回退被黑洞的 docker.io，必须短限时
+                limit=45
+              fi
+              if out=$(timeout "$limit" docker pull -q "$cand" 2>&1); then
+                # 命中镜像站时才导出，构建期用镜像站地址，绕开 daemon 上不可用的 registry-mirrors
+                if [ "$cand" != "$ref" ]; then
+                  docker tag "$cand" "$ref"
+                  echo "${var}=${cand}" >> "$GITHUB_ENV"
+                fi
+                echo "[OK] 镜像可用：${ref} ← ${cand}"
+                return 0
+              fi
+              echo "[跳过] ${cand}：$(echo "$out" | tail -n 1)"
+            done
+            echo "[失败] 所有镜像源均无法提供 ${ref}"
+            return 1
+          }
+
+          # 兜底：所有 registry 都不可达（墙内直连被黑洞、镜像站超时）时，
+          # 从国内 npmmirror 取 ffmpeg-static 的静态 ffmpeg / ffprobe 二进制，
+          # 重新打包后用 docker import 合成 FFMPEG_IMAGE 同名镜像。
+          # docker import 只经本地 socket 把 tar 交给 dockerd 展开，完全不使用 dockerd 的网络栈，
+          # 因此不受墙、代理、daemon 配置影响；合成后 BuildKit 的 FROM 直接命中本地镜像。
+          synth_ffmpeg_image() {
+            ref="$1"
+            base="${FFMPEG_STATIC_BASE}/${FFMPEG_STATIC_VERSION}"
+            dir=/tmp/ffmpeg-static
+            rm -rf "$dir"; mkdir -p "$dir"
+            for f in ffmpeg ffprobe; do
+              url="${base}/${f}-linux-x64.gz"
+              echo "[兜底] 获取 ${f}：${url}"
+              # 先直连（国内源通常几 MB/s）；失败再退回构建代理
+              if ! curl -fsSL --retry 2 --retry-delay 3 --max-time 600 -o "$dir/$f.gz" "$url"; then
+                if [ -n "$PROXY" ] && [ "$PROXY" != "none" ]; then
+                  echo "[兜底] 直连失败，改用代理 ${PROXY}"
+                  curl -fsSL --retry 2 --retry-delay 3 --max-time 600 -x "$PROXY" -o "$dir/$f.gz" "$url" || return 1
+                else
+                  return 1
+                fi
+              fi
+              # gunzip 优先，容器里没有则退回 python3（本工作流已确认存在 python3）
+              if ! gunzip -c "$dir/$f.gz" > "$dir/$f" 2>/dev/null; then
+                python3 -c 'import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1],"rb"), open(sys.argv[2],"wb"))' \
+                  "$dir/$f.gz" "$dir/$f" || return 1
+              fi
+              chmod 755 "$dir/$f"
+            done
+            ( cd "$dir" && tar -cf image.tar ffmpeg ffprobe ) || return 1
+            docker import "$dir/image.tar" "$ref" >/dev/null || return 1
+            echo "[兜底] 已本地合成镜像 ${ref}"
+            docker image inspect "$ref" --format '        {{.Id}}  {{.Size}} bytes' || true
+            return 0
+          }
+
+          ok=0
+          # 基础镜像先试默认地址（daemon 的 registry-mirrors 生效），失败再逐站尝试
+          resolve "${BASE_IMAGE:-python:3.12.13-slim-bookworm}" RESOLVED_BASE_IMAGE || ok=1
+          ffmpeg_ref="${FFMPEG_IMAGE:-${DEFAULT_FFMPEG_IMAGE}}"
+          if ! resolve "$ffmpeg_ref" RESOLVED_FFMPEG_IMAGE; then
+            # 只有 registry 全不通时才走本地合成，避免正常情况下白下载 60MB
+            if synth_ffmpeg_image "$ffmpeg_ref"; then
+              resolve "$ffmpeg_ref" RESOLVED_FFMPEG_IMAGE || ok=1
+            else
+              ok=1
+            fi
+          fi
+          if [ "$ok" != "0" ]; then
+            echo '提示：下面三选一（构建必须能取到 mwader/static-ffmpeg:8.1.1）'
+            echo '  1) 推荐：给 runner 主机的 dockerd 配代理，一劳永逸，BuildKit 解析镜像元数据也走代理'
+            echo '     新建 /etc/systemd/system/docker.service.d/http-proxy.conf 写入：'
+            echo '       [Service]'
+            echo "       Environment=\"HTTP_PROXY=${DEFAULT_BUILD_PROXY}\""
+            echo "       Environment=\"HTTPS_PROXY=${DEFAULT_BUILD_PROXY}\""
+            echo "       Environment=\"NO_PROXY=localhost,127.0.0.1,${GITEA_HOST}${NO_PROXY_EXTRA:+,${NO_PROXY_EXTRA}}\""
+            echo '     （代理服务就在 NAS 本机：内网直接写上面这个 IP，不要写它的公网域名——域名要走路由器回环）'
+            echo '     然后执行：sudo systemctl daemon-reload && sudo systemctl restart docker'
+            echo '  2) 在能拉到该镜像的机器上推到内网 registry，再设仓库 Secret：'
+            echo "     FFMPEG_IMAGE=${REGISTRY}/pyss56/static-ffmpeg:8.1.1"
+            echo '  3) 内置兜底（无需人工操作）：从国内 npmmirror 下载 ffmpeg-static 二进制并本地合成镜像'
+            echo "     地址：${FFMPEG_STATIC_BASE}/${FFMPEG_STATIC_VERSION}/<ffmpeg|ffprobe>-linux-x64.gz，可用仓库 Secret 覆盖换源"
+            echo '     走到这里说明兜底也失败了，先确认 runner 容器能否直连：'
+            echo "     curl -sI -m 10 ${FFMPEG_STATIC_BASE}/${FFMPEG_STATIC_VERSION}/ffmpeg-linux-x64.gz"
+            exit 1
+          fi
+
+      - name: Build image (linux/amd64)
+        env:
+          BUILD_PROXY: ${{ secrets.BUILD_PROXY }}
+          BASE_IMAGE: ${{ secrets.BASE_IMAGE }}
+          FFMPEG_IMAGE: ${{ secrets.FFMPEG_IMAGE }}
+          APT_MIRROR: ${{ secrets.APT_MIRROR }}
+          PIP_INDEX_URL: ${{ secrets.PIP_INDEX_URL }}
+          NO_PROXY_EXTRA: ${{ secrets.NO_PROXY_EXTRA }}
+          FRONTEND_DIST_URL: ${{ secrets.FRONTEND_DIST_URL }}
+          PLUGINS_ARCHIVE_URL: ${{ secrets.PLUGINS_ARCHIVE_URL }}
+          RESOURCES_RAW_BASE: ${{ secrets.RESOURCES_RAW_BASE }}
+        run: |
+          PROXY="${BUILD_PROXY:-${DEFAULT_BUILD_PROXY}}"
+          # 国内软件源必须直连（比走代理快 1~2 个数量级），从 NO_PROXY 放行
+          APT_MIRROR_HOST="${APT_MIRROR:-${DEFAULT_APT_MIRROR}}"
+          PIP_MIRROR_INDEX="${PIP_INDEX_URL:-${DEFAULT_PIP_INDEX_URL}}"
+          # 需要直连的自有域名一律由仓库 Secret（NO_PROXY_EXTRA）注入，不写进仓库
+          NO_PROXY_LIST="localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,${GITEA_HOST},${APT_MIRROR_HOST}"
+          if [ -n "${NO_PROXY_EXTRA:-}" ]; then NO_PROXY_LIST="${NO_PROXY_LIST},${NO_PROXY_EXTRA}"; fi
+          BUILD_ARGS=()
+          if [ -n "$PROXY" ] && [ "$PROXY" != "none" ]; then
+            # Docker 预定义构建参数：传入后本次构建的所有 RUN 步骤都会带上代理环境变量
+            BUILD_ARGS+=(--build-arg "HTTP_PROXY=$PROXY" --build-arg "HTTPS_PROXY=$PROXY")
+            BUILD_ARGS+=(--build-arg "http_proxy=$PROXY" --build-arg "https_proxy=$PROXY")
+            BUILD_ARGS+=(--build-arg "NO_PROXY=$NO_PROXY_LIST")
+            echo "构建期代理：$PROXY（${APT_MIRROR_HOST} 直连）"
+          else
+            echo "构建期不使用代理"
+          fi
+          # apt / pip 切国内镜像：由 Dockerfile 的构建参数生效，不依赖 daemon 配置
+          BUILD_ARGS+=(--build-arg "APT_MIRROR=$APT_MIRROR_HOST")
+          BUILD_ARGS+=(--build-arg "PIP_INDEX_URL=$PIP_MIRROR_INDEX")
+          # 镜像地址优先用 Secrets，其次用嗅探结果（显式镜像站不受 daemon registry-mirrors 影响）
+          if [ -n "${BASE_IMAGE:-}" ]; then BUILD_ARGS+=(--build-arg "BASE_IMAGE=$BASE_IMAGE")
+          elif [ -n "${RESOLVED_BASE_IMAGE:-}" ]; then BUILD_ARGS+=(--build-arg "BASE_IMAGE=$RESOLVED_BASE_IMAGE"); fi
+          if [ -n "${FFMPEG_IMAGE:-}" ]; then BUILD_ARGS+=(--build-arg "FFMPEG_IMAGE=$FFMPEG_IMAGE")
+          elif [ -n "${RESOLVED_FFMPEG_IMAGE:-}" ]; then BUILD_ARGS+=(--build-arg "FFMPEG_IMAGE=$RESOLVED_FFMPEG_IMAGE"); fi
+          if [ -n "$FRONTEND_DIST_URL" ]; then BUILD_ARGS+=(--build-arg "FRONTEND_DIST_URL=$FRONTEND_DIST_URL"); fi
+          if [ -n "$PLUGINS_ARCHIVE_URL" ]; then BUILD_ARGS+=(--build-arg "PLUGINS_ARCHIVE_URL=$PLUGINS_ARCHIVE_URL"); fi
+          if [ -n "$RESOURCES_RAW_BASE" ]; then BUILD_ARGS+=(--build-arg "RESOURCES_RAW_BASE=$RESOURCES_RAW_BASE"); fi
+
+          docker build \
+            -f docker/Dockerfile \
+            -t "$REGISTRY/$IMAGE_NAME:${APP_VERSION}" \
+            -t "$REGISTRY/$IMAGE_NAME:latest" \
+            -t "$REGISTRY/$IMAGE_NAME:${SHORT_SHA}" \
+            "${BUILD_ARGS[@]}" \
+            .
+
+      - name: Push image
+        run: |
+          docker push "$REGISTRY/$IMAGE_NAME:${APP_VERSION}"
+          docker push "$REGISTRY/$IMAGE_NAME:latest"
+          docker push "$REGISTRY/$IMAGE_NAME:${SHORT_SHA}"
+          docker image inspect "$REGISTRY/$IMAGE_NAME:${APP_VERSION}" --format '镜像：{{.RepoTags}} 大小：{{.Size}}'
+
+      - name: Logout
+        if: always()
+        run: docker logout "$REGISTRY" || true
