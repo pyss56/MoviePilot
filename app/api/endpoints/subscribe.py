@@ -251,7 +251,7 @@ async def create_subscribe(
     """
     # 类型转换
     if subscribe_in.type:
-        mtype = MediaType(subscribe_in.type)
+        mtype = MediaType.from_agent(subscribe_in.type) or MediaType(subscribe_in.type)
     else:
         mtype = None
     # 非 TMDB 来源的标题可能自带季标记，入库前统一拆分。
