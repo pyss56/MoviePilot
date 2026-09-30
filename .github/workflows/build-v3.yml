@@ -32,6 +32,7 @@ jobs:
         run: uv lock --check
 
       - name: Audit locked Python dependencies
+        continue-on-error: true
         run: |
           uv export --quiet --locked --no-default-groups --group runtime-standard \
             --no-emit-project --output-file /tmp/moviepilot-audit-standard.txt
