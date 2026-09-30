@@ -6,29 +6,15 @@ import binascii
 import json
 import secrets
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Protocol, Tuple
 from urllib.parse import urlparse
-
-from webauthn import (
-    generate_authentication_options,
-    generate_registration_options,
-    options_to_json,
-    verify_authentication_response,
-    verify_registration_response,
-)
-from webauthn.helpers import parse_authentication_credential_json, parse_registration_credential_json
-from webauthn.helpers.cose import COSEAlgorithmIdentifier
-from webauthn.helpers.exceptions import InvalidRegistrationResponse
-from webauthn.helpers.structs import (
-    AuthenticatorSelectionCriteria,
-    AuthenticatorTransport,
-    PublicKeyCredentialDescriptor,
-    ResidentKeyRequirement,
-    UserVerificationRequirement,
-)
 
 from app.application.configuration import get_api_runtime_config_snapshot
 from app.runtime.log import logger
+
+# webauthn 约 14MB，只在 Passkey 注册与登录时才用到，改为方法内导入，避免随 API 路由加载常驻
+if TYPE_CHECKING:
+    from webauthn.helpers.structs import PublicKeyCredentialDescriptor, UserVerificationRequirement
 
 PASSKEY_CHALLENGE_TTL_SECONDS = 5 * 60
 PasskeyChallengePurpose = Literal["authentication", "registration"]
@@ -206,6 +192,7 @@ class PassKeyHelper:
         :param credentials: 凭证字典列表
         :return: PublicKeyCredentialDescriptor 列表
         """
+        from webauthn.helpers.structs import AuthenticatorTransport, PublicKeyCredentialDescriptor
         result = []
         for cred in credentials:
             try:
@@ -230,6 +217,7 @@ class PassKeyHelper:
         :param user_verification: 指定的用户验证要求，如果不指定则从配置中读取
         :return: UserVerificationRequirement
         """
+        from webauthn.helpers.structs import UserVerificationRequirement
         if user_verification:
             return UserVerificationRequirement(user_verification)
         return UserVerificationRequirement.REQUIRED if get_api_runtime_config_snapshot().passkey_require_uv \
@@ -260,13 +248,16 @@ class PassKeyHelper:
     ) -> Tuple[str, str]:
         """
         生成注册选项
-        
+
         :param user_id: 用户ID
         :param username: 用户名
         :param display_name: 显示名称
         :param existing_credentials: 已存在的凭证列表
         :return: (options_json, challenge)
         """
+        from webauthn import generate_registration_options, options_to_json
+        from webauthn.helpers.cose import COSEAlgorithmIdentifier
+        from webauthn.helpers.structs import AuthenticatorSelectionCriteria, ResidentKeyRequirement
         try:
             # 用户信息
             user_id_bytes = str(user_id).encode('utf-8')
@@ -318,13 +309,16 @@ class PassKeyHelper:
     ) -> Tuple[str, str, int, Optional[str]]:
         """
         验证注册响应
-        
+
         :param credential: 客户端返回的凭证
         :param expected_challenge: 期望的challenge
         :param expected_origin: 期望的源地址
         :param expected_rp_id: 期望的RP ID
         :return: (credential_id, public_key, sign_count, aaguid)
         """
+        from webauthn import verify_registration_response
+        from webauthn.helpers import parse_registration_credential_json
+        from webauthn.helpers.exceptions import InvalidRegistrationResponse
         try:
             # 准备验证参数
             origin, rp_id = PassKeyHelper._get_verification_params(expected_origin, expected_rp_id)
@@ -374,11 +368,12 @@ class PassKeyHelper:
     ) -> Tuple[str, str]:
         """
         生成认证选项
-        
+
         :param existing_credentials: 已存在的凭证列表（用于限制可用凭证）
         :param user_verification: 用户验证要求，如果不指定则从配置中读取
         :return: (options_json, challenge)
         """
+        from webauthn import generate_authentication_options, options_to_json
         try:
             # 允许的凭证
             allow_credentials = PassKeyHelper._parse_credential_list(existing_credentials) \
@@ -417,7 +412,7 @@ class PassKeyHelper:
     ) -> Tuple[bool, int]:
         """
         验证认证响应
-        
+
         :param credential: 客户端返回的凭证
         :param expected_challenge: 期望的challenge
         :param credential_public_key: 凭证公钥
@@ -426,6 +421,8 @@ class PassKeyHelper:
         :param expected_rp_id: 期望的RP ID
         :return: (验证成功, 新的签名计数)
         """
+        from webauthn import verify_authentication_response
+        from webauthn.helpers import parse_authentication_credential_json
         try:
             # 准备验证参数
             origin, rp_id = PassKeyHelper._get_verification_params(expected_origin, expected_rp_id)

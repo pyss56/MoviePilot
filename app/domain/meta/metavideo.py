@@ -338,7 +338,7 @@ class MetaVideo(MetaBase):
         state: _VideoParseState,
     ) -> bool:
         """
-        识别名称
+        识别名称，并只忽略原始文件名末尾的媒体扩展名。
         """
         if not token:
             return False
@@ -422,7 +422,11 @@ class MetaVideo(MetaBase):
                 return False
             else:
                 # 后缀名不要
-                if ".%s".lower() % token in media_exts:
+                suffix = f".{token.lower()}"
+                if (
+                    suffix in media_exts
+                    and (self.org_string or "").lower().endswith(suffix)
+                ):
                     return False
                 # 英文或者英文+数字，拼装起来
                 if self.en_name:
@@ -865,7 +869,7 @@ class MetaVideo(MetaBase):
             fps_value = None
             if re_res.group(1):  # FPS格式
                 fps_value = re_res.group(1)
-            
+
             if fps_value and fps_value.isdigit():
                 # 只存储纯数值
                 self.fps = int(fps_value)

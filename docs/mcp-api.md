@@ -21,6 +21,16 @@ MCP 使用系统配置中的 `API_TOKEN` 作为认证密钥，文档中的 API K
 
 `POST /api/v1/history/transfer/{history_id}/discard-corrupt` 属于需要管理权限的整理恢复 REST 接口，不向 Agent gateway 暴露。成功响应的 `data.history_id` 为保留的整理历史 ID；任务已清理时同样返回该结构，历史不存在时返回业务失败。
 
+图片 REST 接口 `/api/v1/system/img/{proxy}` 和 `/api/v1/system/cache/image` 自动将已配置
+站点的主域名及访问地址加入图片域名白名单（含停用站点，便于展示图标），无需手动配置
+`SECURITY_IMAGE_DOMAINS`。站点域名快照在内存中复用，同一事件循环的并发加载合并为一次查询；
+站点新增、改址或删除提交后立即失效，另有 60 秒过期兜底。`TMDB_IMAGE_DOMAIN`、
+`MUSIC_COVER_PROXY`、`WALLPAPER_IMAGE_URL`、`CUSTOMIZE_WALLPAPER_API_URL` 和启用时的
+`BANGUMI_IMAGE_DOMAIN` 的 HTTP(S) 主机也自动放行，配置变更即时生效。壁纸 API 返回的其他
+域名不自动扩展授权；必要时加入 `SECURITY_IMAGE_DOMAINS`。
+域名放行后仍执行 DNS/私网校验，
+Fake-IP 等非公网解析地址需要通过 `IMAGE_PROXY_ALLOWED_PRIVATE_RANGES` 明确允许。
+
 ## 2. 标准 MCP 协议 (JSON-RPC 2.0)
 
 ### 端点
@@ -41,6 +51,87 @@ MCP 使用系统配置中的 `API_TOKEN` 作为认证密钥，文档中的 API K
 
 MCP 当前不会主动发送工具列表变更通知（`listChanged=false`）。如果客户端缓存了工具列表，插件状态变化后需要让客户端重新请求 `tools/list`；无法手动刷新的客户端应重新连接 MCP 服务或新建会话。
 
+### 插件实例日志等级
+
+`plugin.loglevel.get` 使用源插件 ID 查询，返回该插件全部实例（首项固定是本体自身，其后
+是各个分身）的 `configured_level`、`expires_at` 与 `effective_level`。用某个分身自身的
+实例 ID 当作 `plugin_id` 会被拒绝——分身的日志等级归它的源插件管。`configured_level`
+为 `null` 表示没有覆盖或覆盖已过期；`effective_level` 才是此刻真正用于过滤的等级。
+
+`plugin.loglevel.set` 与 `plugin.loglevel.clear` 使用该总览返回的精确 `instance_id`，
+运行期立即生效，不必重载插件，也不改变全局日志等级。`expires_at` 为空表示覆盖不过期；
+提交不带时区的时间会按 UTC 解读，与查询接口返回的 UTC 时刻保持一致。覆盖过期后自动回落
+全局等级，不需要再调一次 `clear`；重复 `clear` 保持幂等。
+
+覆盖只对宿主受控调用点内产生的日志生效——插件的构造与 `init_plugin`、事件处理器、定时
+服务回调、插件自己声明的 HTTP 端点。插件自建的原生线程不继承这个绑定，其中的日志仍按
+全局等级过滤，不要据此断定覆盖没有写进去。
+
+### 插件实例默认调用目标
+
+`plugin.default_target.set` 与 `plugin.default_target.clear` 使用源插件 ID 加实例 ID
+指定「只给插件 ID、没给实例 ID 的调用应当落到哪个实例」。同一源插件至多一个默认调用
+目标，置新会自动清掉旧的；清除只在当前置位的正是该实例时才动作，重复调用保持幂等。
+
+一个插件有分身而未设置默认调用目标时，未指定实例的调用会直接报错，**不会**随机挑一个、
+也不会按登记顺序取第一个：那会让同一次调用在不同时刻落到不同实例，既无法复现，也无从
+知道刚才是哪个实例执行的。默认目标被停用时同样报错，不静默改走另一个正在运行的实例。
+只有本体、没有任何分身的插件不受这套机制约束，不需要显式设置默认目标。
+
+### 插件实例启停
+
+`plugin.instance.set_enabled` 用实例 ID 启用或停用一个实例，本体与分身共用这一个入口
+（实例 ID 等于插件 ID 时指的是本体自身）。
+
+停用不是删除：业务参数与展示信息原样留在那一行等待再次启用，因而「停掉一个实例」与
+「丢掉它的配置」终于是两件事——此前两者绑死，想保住配置就只能留着一个在跑的实例。
+只有删掉整行才是彻底清理。停用会同时清掉该实例的默认调用目标置位与日志等级覆盖：
+前者会把未指定实例的调用路由到一个不会被实例化的实例，后者本就是带失效时间的临时
+调试设置。
+
+是否启用与此刻是否在运行是两回事：前者是落盘的装载判据，后者由运行时持有、不落盘。
+
+### 插件实例彻底清理
+
+`plugin.instance.purge` 用实例 ID 按四项独立范围删除该实例的持久化内容：业务参数
+（`config`）、插件数据表中的行（`plugin_data`）、插件自有数据库（`own_database`）、
+插件数据目录（`data_directory`）。四项全部默认为假，一项都没选直接返回失败，服务端
+不替调用方补默认值——清理不可逆，漏删只是少删，多删可能毁掉用户特意留下的数据。
+
+它与停用不是一件事：停用只把启用位置假、设置原样留着随时可恢复，这里才真正删除用户
+数据。响应的 `purged` 列出本次真正清掉的范围，目录本就不存在时不会出现在其中；
+`instance_removed` 说明实例行是否随之消失——分身会删，本体保留，本体那一行还承载着
+该插件的启用状态与展示覆盖。
+
+选了删数据目录就必然先销毁自有数据库（库文件落在该目录下），但未单独勾选 `own_database`
+时不会把它计入 `purged`。实例 ID 必须是合法的插件实例 ID（字母开头、仅字母与数字）：
+它会被拼进插件数据目录路径，带路径分隔符或上跳的标识一律在动任何存储之前被拒绝。
+
+### 插件分身的创建与恢复
+
+`plugin.clone` 用源插件 ID 创建一个共享它源码的分身。`suffix` 可以不填：留空时由服务端
+挑一个最小可用序号（本体算第 1 个实例，分身从 2 起排），因而调用方**算不出**分身 ID，
+必须从回执的 `data.instance_id` 取。填了后缀则只接受 ASCII 字母与数字，且在请求解析阶段
+就会被拦下——非法后缀拼出的实例 ID 用不了 Python 类名与路由段，等落库再报错意味着已经
+写出一行、还要靠回滚擦掉。
+
+占号判据不止看「此刻在不在跑」：当前已装载的类、实例表里的每一行（含已停用的分身与本体）、
+安装清单，以及磁盘上留存的插件包目录，任意一项命中都算已占用。自动分配与手填后缀共用这
+同一个判据，自动分配因此不会挑中一个手填时会被拒绝的 ID。
+
+同一个后缀名下留有一个**已停用**的分身时，这次创建就是把那一行重新置为启用，而不是新建：
+停用从不删行，业务参数一直挂在上面，恢复因而拿回的正是用户当初留下的那份配置。展示名、
+描述与图标留空则沿用停用前登记的那一份，填了就按填的改。要改为「丢掉旧配置、按源插件模板
+重建」，把 `restore_previous` 置为 false——静默丢弃用户数据不能是默认行为。恢复失败时只
+把启用位退回停用，不会连同那一行与它的配置一起毁掉。
+
+`plugin.clone.restorable` 用源插件 ID 列出该插件名下所有已停用、配置仍留存的分身，给出
+实例 ID、相对源插件 ID 的后缀、停用前登记的展示信息，以及是否留有业务参数。启用中的分身
+不在此列：它们的配置正被使用，拿来「恢复」没有意义。
+
+被 `plugin.instance.purge` 彻底清理掉的分身也不在此列，而且不可恢复：清理删的是实例行
+本身，恢复所依赖的那份留存配置随之消失，同后缀再建只会得到一个全新的空白分身。
+
 ## 3.1 结构化 Agent 工具与完整参数合同
 
 `tools/list` 会为以下四个正式入口返回可直接校验的 JSON Schema。每个入口都按 operation/action 生成 `oneOf` 分支，分支中包含必填字段、类型、默认值、枚举、嵌套对象和互斥/至少一项等跨字段规则；外部 MCP 客户端可以在一次 `tools/call` 中完成参数构造，不需要猜测 URL、HTTP 方法或第三方 SDK 参数。
@@ -56,23 +147,23 @@ MCP 当前不会主动发送工具列表变更通知（`listChanged=false`）。
 
 `app/agent/policy/resources/api_mcp_schema.json` 是 `moviepilot_api` 的生成制品，不是设置项或 API 参数的手工事实源。`scripts/generate_agent_api_mcp_schema.py` 从当前 FastAPI OpenAPI、固定 operation 路由和 Agent 专用英文参数说明生成该文件；运行时直接读取它响应外部 MCP `tools/list`，测试会校验生成结果没有漂移。修改 API、请求模型或 operation 后应重新生成并提交该文件，不应直接编辑 JSON。
 
-当前完整 FastAPI OpenAPI 包含 400 个 HTTP 操作，其中 220 个稳定业务操作进入
-`moviepilot_api`，使用 218 个固定路由模板：217 条 OpenAPI 路由直接匹配，另有 1 条只允许
+当前完整 FastAPI OpenAPI 包含 421 个 HTTP 操作，其中 231 个稳定业务操作进入
+`moviepilot_api`，使用 229 个固定路由模板：228 条 OpenAPI 路由直接匹配，另有 1 条只允许
 `tmdb`、`douban`、`bangumi`、`anilist` 四个来源的受限人物作品动态路由。每个 operation
 均同时具备固定 method/path、角色权限、副作用等级、确认与恢复策略、结果敏感性、英文用途说明，
 以及可直接提交的 path/query/body JSON Schema；Skill front matter、正文 operation 章节、运行时
-注册表和 MCP `tools/list` 的 220 个 `oneOf` 分支必须完全一致。
+注册表和 MCP `tools/list` 的 231 个 `oneOf` 分支必须完全一致。
 
-数量不相等是明确的安全与语义边界，而不是漏生成。当前 400 条路由均被审计并锁定为以下一种
+数量不相等是明确的安全与语义边界，而不是漏生成。当前 410 条路由均被审计并锁定为以下一种
 归属，审计生成器不再提供“未归类”兜底：
 
 | 归属 | 数量 | Agent 使用方式 |
 | :--- | ---: | :--- |
-| `gateway` | 217 | 通过 `moviepilot_api` 的稳定 operation 和精确参数合同调用 |
+| `gateway` | 228 | 通过 `moviepilot_api` 的稳定 operation 和精确参数合同调用 |
 | `consolidated` | 71 | 通过同领域聚合 operation 调用，不复制数据源或前端专用路由 |
 | `provider-skill` | 12 | 通过下载器或媒体服务器 Skill 调用第三方 provider API |
 | `alternate-auth-duplicate` | 11 | 使用对应 bearer-authenticated gateway operation，不暴露 API_TOKEN 兼容副本 |
-| `transport_or_identity` | 66 | 由登录、令牌、MCP、会话、回调、健康检查等宿主传输/身份边界拥有 |
+| `transport_or_identity` | 76 | 由登录、令牌、MCP、会话、回调、健康检查等宿主传输/身份边界拥有 |
 | `stream_or_binary` | 10 | 由直接客户端处理流式日志、消息、文件、图片等非结构化响应 |
 | `ui_presentation` | 13 | 由前端或插件渲染面拥有，不作为业务 Agent operation |
 
@@ -96,6 +187,10 @@ operation ID、权限、副作用、确认、恢复、结果敏感性及精确�
 ```
 
 只允许传 `tools/list` 对应 operation 分支中声明的 `path_params`、`query` 和 `body` 字段。不得传 URL、认证头、API Token 或任意 HTTP 方法。
+
+`body` 使用原生 JSON 值。对象和数组直接传入；仅在选定的 operation 允许时传 `null`。当前唯一的字符串请求体为 `system.upgrade.dev` 的固定值 `"dev"`。网关会按选定的 operation 合同校验请求体类型和字段。
+
+`search.torrents` 可能按媒体标题与别名分轮搜索站点：MoviePilot 内层请求最多等待 290 秒，Agent 工具总等待上限为 300 秒，预留 10 秒处理超时与返回结果；V3 MCP 包装层继续使用原有 `mcp_proxy_timeout` 配置（默认 600 秒）。其它 operation 沿用原有超时配置。`page` / `count` 只分页已完成的搜索结果，不会缩短站点搜索过程。
 
 查询结果的兼容分页合同如下：
 
@@ -154,13 +249,16 @@ operation ID、权限、副作用、确认、恢复、结果敏感性及精确�
 
 系统设置统一使用 `moviepilot_api`，不需要恢复旧的 `query_system_settings` / `update_system_settings` 工具：
 
+- `config.system.list` 只返回分页的轻量合同索引，不读取当前值；支持 `group`、`keyword`、`source`、`offset` 和 `limit`。
+- `config.system.describe` 读取一个精确设置的完整 JSON Schema、默认值/单位/示例、依赖与冲突、写入边界、当前值和稳定 `revision`；敏感值默认脱敏。
 - `config.system.get` 同时查询 `Settings` 运行配置变量和 `SystemConfigKey` 数据库配置。可用 `setting_key` 精确读取，或用 `group` + `keyword` 发现键；单项默认返回完整值，多项默认只返回摘要。
 - 每个发现结果都返回动态 `definition`：声明类型、当前值形状、是否可空/敏感、允许的更新操作、列表默认匹配字段和持久化位置。Agent 应先发现定义，再按返回的精确键和形状调用更新。
 - `config.system.update` 支持 `replace`、`merge_dict`、`upsert_list_item`、`remove_list_item`。`Settings` 字段会执行类型转换并持久化到 `app.env`；`SystemConfigKey` 会经配置服务写入数据库并发布配置变更事件。
+- 新客户端应将 `describe` 返回的 `revision` 作为 `expected_revision` 回传；省略该字段仍保留旧客户端的非条件更新兼容行为。`generic_write_allowed=false` 的复杂或内部配置必须改用返回的专用 operation，过期 revision 返回冲突而不覆盖其他写入。
 - 敏感值默认脱敏；只有管理员明确要求时才传 `query.show_secrets=true`，并继续受宿主确认和保护输出策略约束。
 - `database_operation` 直接修改 `systemconfig` 只用于受控数据修复。普通配置修改不得绕过键注册、类型转换、插件 mutation 门禁和事件通知。
 
-`skills/moviepilot-api/SKILL.md` 只维护稳定的发现与更新流程，不复制当前版本全部 `Settings` / `SystemConfigKey` 清单。真实键、类型和值形状由 `config.system.get` 运行时发现；MCP `tools/list` 的 `config.system.get/update` 分支负责说明发现参数和更新请求结构。
+`skills/moviepilot-api/SKILL.md` 只维护稳定的发现与更新流程，不复制当前版本全部 `Settings` / `SystemConfigKey` 清单。真实键、类型和值形状由 `config.system.list` / `config.system.describe` 运行时发现；MCP `tools/list` 的 `config.system.list/describe/get/update` 分支负责说明发现参数和更新请求结构。
 
 ---
 
@@ -247,6 +345,38 @@ MoviePilot 也提供普通 REST API 给前端和自动化客户端使用。所�
 - SSE、文件、图片、HTML、空响应，以及 OAuth2 登录、OpenAI、Anthropic、MCP JSON-RPC 等标准协议端点保持协议原生响应体；它们会在 OpenAPI 中显式声明对应的流、文件或协议模型。
 - 插件通过 `get_api()` 动态注册的 `/api/v1/plugin/...` 端点不属于主程序统一响应信封范围。插件自行声明响应模型、状态码和返回体，宿主只补充路径与鉴权依赖。
 
+#### GitHub Token 授权
+
+GitHub Token 是可选的管理员配置，可在设置页或首次初始化页通过 GitHub Device Flow 授权，
+也可以直接保存已有的 PAT。Device Flow 请求 `read:user`、`repo`、`workflow`：用于读取授权
+用户身份、读写公开和私有仓库，以及推送 GitHub Actions 工作流文件。旧 OAuth Token 缺少这些
+范围时，状态接口会提示重新授权。授权接口只返回脱敏状态，不会把访问 Token 或刷新 Token
+放进响应。
+
+反馈问题和创建 PR 两个 Agent Skill 共用服务端 Token。它们先读取目标仓库的
+`REPO_GITHUB_TOKEN`，再回退到 `GITHUB_TOKEN`；两种设置页入口（Device Flow 和手动 PAT）
+都保存到 `GITHUB_TOKEN`，因此授权一次后无需在对话中重复提供凭据。OAuth 授权包含仓库读写
+权限，GitHub 会在确认页展示；手动 PAT 也必须具备目标仓库对应的 Issue、Fork、Contents、PR
+和必要时的 workflow 权限。
+
+已完成初始化的实例使用登录态超级管理员接口：
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| GET | `/api/v1/github/auth/status` | 查询 Token 是否已配置、是否有效、来源和脱敏摘要 |
+| POST | `/api/v1/github/auth/start` | 申请设备码；响应包含 `session_id`、`verification_uri` 和 `user_code` |
+| POST | `/api/v1/github/auth/poll` | 请求体 `{"session_id":"..."}`，轮询授权状态 |
+| POST | `/api/v1/github/auth/manual` | 请求体 `{"token":"..."}`，保存手动 PAT |
+| DELETE | `/api/v1/github/auth/token` | 清除 Token 和 OAuth 刷新元数据 |
+
+首次初始化窗口使用同样的操作，但路径前缀为 `/api/v1/login/github-auth`，例如
+`/api/v1/login/github-auth/start`；这些接口只在系统尚未创建用户时开放，初始化完成后返回
+`409`，不应作为已初始化实例的未认证管理入口。
+
+`GITHUB_TOKEN` 属于敏感运行时设置，通用环境设置接口只返回脱敏值。Agent Skill 只读取服务端
+配置，不会要求用户在聊天中发送 Token 或密码。OAuth 与 PAT 实际能访问的仓库仍受 GitHub
+账号和仓库策略限制。
+
 客户端可发送 `X-MoviePilot-Locale: zh-CN|zh-TW|en-US` 或 `Accept-Language`。后端会按当前请求语言直接翻译顶层 `message`；未提供语言头时使用简体中文，翻译缺失时回退原文本。SSE 和业务数据中原有的 `text_i18n`、`error_i18n` 等展示字段继续保留。
 
 `GET /api/v1/login/wallpaper` 会将壁纸 URL 放在 `data` 字段中。`POST /api/v1/user/avatar/{user_id}` 会以 `data.filename` 返回原始文件名。上述接口的 `message` 均不承载业务数据。
@@ -281,13 +411,13 @@ FastAPI 的 HTTP 异常和参数校验异常统一使用 `message`，不再返�
 | GET | `/api/v1/media/recognize` | 识别标题，参数：`title`、`subtitle`、`custom_words`，可选 `media_source`；当 `title` 为含目录的媒体文件路径时，会合并父目录中的名称、年份等信息 |
 | GET | `/api/v1/media/recognize_file` | 识别文件路径，参数：`path`，可选 `media_source` |
 | GET | `/api/v1/media/{media_id}` | 按原生 ID 查询影视或音乐详情；必填参数：`media_source`、`type_name`，其中 `media_source` 与路径中的 `media_id` 组成统一媒体身份，`type_name` 支持电影、电视剧和音乐 |
-| POST | `/api/v1/media/scrape/{storage}` | 刮削媒体元数据；请求体为 `FileItem`，可选查询参数 `media_source`、`media_id`、`type_name`（电影/电视剧/音乐）。音乐会按策略处理音频标签、封面和歌词 |
+| POST | `/api/v1/media/scrape/{storage}` | 刮削媒体元数据；请求体为 `FileItem`，可选查询参数 `media_source`、`media_id`、`type_name`（电影/电视剧/音乐）和 TMDB `episode_group`。剧集组用于指定电视剧的季集顺序；音乐会按策略处理音频标签、封面和歌词 |
 | POST | `/api/v1/transfer/manual/target-path` | 按源文件与目录配置匹配手动整理目标路径；请求体为 `ManualTransferItem`，该接口不执行媒体识别 |
 | POST | `/api/v1/transfer/manual/history` | 查询文件、批量文件或目录命中的成功整理历史摘要，用于进入手动整理界面时显示重新整理状态 |
 | POST | `/api/v1/transfer/manual` | 手动整理；请求体可用 `media_source` + `media_id` 指定本次识别与刮削数据源；`logids` 会先还原为同一个显式文件批次，多首音乐因而共享专辑识别上下文；音乐请求未传 `music_type` 时，目录按 `album`、文件按 `recording` 解释；可用最多三项的 `music_release_regions`（ISO 3166-1）和 `music_release_scripts`（ISO 15924）仅覆盖本次 MusicBrainz 发行版本排序，省略时继承系统设置；命中持久失败历史，且未指定媒体身份、未开启 `reorganize` 时，由调度器重试原计划（包括 `logid` 历史入口）；显式重整先校验并放弃确定失败任务，再清理旧目标和记录；旧版失败历史仍清理后重试；`reorganize=true` 时清理命中的成功历史和非移动模式旧目标后重新整理 |
 | GET | `/api/v1/transfer/tasks/manual-reviews` | 管理员分页查询 durable 人工复核任务；`state` 仅允许 `manual_review`（默认）或已经人工判定、等待调度恢复的 `retry_wait`，支持 `page` 与 `page_size`。响应只公开任务、源文件、状态、步骤意图/证据/错误和复核修订号，不返回 lease 或 attempt 身份 |
 | GET | `/api/v1/transfer/tasks/{task_id}/manual-review` | 管理员查询单个 durable 人工复核任务详情；仅可读取 `manual_review` 或已经人工判定的 `retry_wait` 任务，其余状态按不存在处理 |
-| POST | `/api/v1/transfer/tasks/{task_id}/manual-review` | 管理员判定处于 `manual_review` 的 durable 整理步骤；请求包含 `operation_id`、`decision=not_applied|applied`、`reason`，`applied` 还必须提供 `result_payload`。`failed` 不属于公开决策，失败终态只能由持租约的 durable 结算写入；响应仅返回任务、操作、决策、后续状态和复核修订号 |
+| POST | `/api/v1/transfer/tasks/{task_id}/manual-review` | 管理员判定处于 `manual_review` 的 durable 整理步骤；请求包含 `operation_id`、`decision=not_applied|applied`，`reason` 选填，省略或空白时记为空字符串，最多 2000 字符；`applied` 还必须提供 `result_payload`。`failed` 不属于公开决策，失败终态只能由持租约的 durable 结算写入；响应仅返回任务、操作、决策、后续状态和复核修订号 |
 
 #### 媒体自动分类
 
@@ -375,11 +505,84 @@ AniList 榜单、探索、详情、人物和推荐接口优先通过 `anilist-ch
 音乐资源搜索及对应 SSE 接口默认只返回精确匹配。手动调用可传 `include_candidates=true`，
 额外返回待确认资源及关联专辑：`match_status=candidate`、`match_reason` 描述原因，
 且 `media_info` 为空、不绑定目标 ID；精确结果为 `match_status=exact`。自动订阅和批量下载
-不采用待确认项。单曲的关联专辑不代表已经确认包含该单曲，专辑下载仍需检查曲目覆盖。
+不采用待确认项。单曲的关联专辑不代表已经确认包含该单曲；专辑资源可以先下载，订阅会累计其中可识别的独立曲目并在全部曲目收齐后完成。
 SSE 的 `candidate_items` 是站点原始返回数量，`match_counts` 记录身份、分类及规则淘汰原因。
 只有完整过滤后还有精确结果时才会按多名称设置提前停止；音乐元数据多来源结果先各自去重再公平合并。
 
 音乐识别结果同时提供 `audio_format`、`audio_lossless`、`audio_quality`、`bit_depth`、`sample_rate`、`bitrate`、`audio_specs` 和 `audio_quality_score`。本地文件识别读取实际音频流参数，并使用 Chromaprint 的 `fpcalc` 在本地生成指纹后查询 AcoustID；音频文件本身不会上传。站点资源识别从标题和描述提取声明参数；码率、采样率的存储单位分别为 bps 和 Hz。
+
+原生 AcoustID 识别会核验最多五个 Recording 候选，以实际时长、有效曲名、艺人和版本排除冲突。
+唯一高分且时长吻合的指纹可补齐无标签或纯编号文件；`Unknown Artist` 等占位不是艺人冲突。
+真实数字歌曲标签仍可整理，`01`、`Track 01` 等抓轨占位不会仅凭完整字段认定为可信歌曲。
+近分歧义或候选被截断时保留 `raw_data.recognition.status=ambiguous`，不能由返回顺序自动选中。
+原生指纹命中的诊断含 `method=fingerprint`、`identity_type=recording`、`release_verified=false`；
+指纹不证明实际发行，补充发行 ID 只保留实际标签提供的值，`album_id` 只沿用标签发行组 ID。
+旧插件的单 ID 接口保持兼容，不人为添加 AcoustID 分数或降低其文本核验要求。
+指纹生成和候选详情共用最多 90 秒、16 次 HTTP 尝试的预算；嵌套调用服从已有更早的预算。
+指纹缓存保留全部候选，成功、无匹配、临时故障分别在 3600、300、15 秒后过期。
+
+`MusicMeta.music_type` 保留已绑定主身份的实体类型；仅从名称推测时可为空。
+`MusicMeta.album_type` 和 `secondary_types` 保留标签声明的发行主副类型，例如 EP、Single、Compilation；
+它们与 recording/album/artist 实体类型不同，不能根据曲目数量覆盖明确的标签类型。
+`media_source`、`media_id` 与 `music_type` 必须一起解释，不能把专辑 ID 当作 Recording ID。
+补充字段 `musicbrainz_release_id`、`musicbrainz_release_group_id`、`musicbrainz_release_track_id`
+分别表示具体发行、发行组和发行中的曲目，不能替代主身份。`original_year` 与 `release_year`
+分别保留原始发行年份和当前发行年份，`year` 继续用于兼容展示；发行组尚未选定具体 Release 时
+不能凭首发年份填充 `release_year`。`total_discs` 保留真实碟数。
+`field_sources` 按字段记录 `tag`、`album_tags`、`stream`、`filename`、`directory`、`torrent`、
+`remote` 或 `manual` 等来源，缺失表示来源未记录；该说明不等于远端身份已验证，也不用于绕过整理准入。
+
+有效 CUE 可补充专辑和逐轨信息，相关字段来源为 `cue`。`music_layout=image_cue` 表示
+一个音频文件包含多个逻辑音轨，`music_type=album`，不使用开头的 Recording 指纹替代整张专辑。
+整轨归档会保留音频及 `cue_filename` 的原名，只规范专辑目录，避免破坏 `FILE` 引用；不自动切轨。
+`cue_tracks` 保留逻辑曲目及每秒 75 帧的索引。`tracks_cue` 的分轨索引仅辅助元数据，
+原 CUE 不随改名自动复制。绝对/跨目录引用、冲突索引、超出音频时长等问题通过
+`organization_error` 返回，并在实际文件操作前阻止整理；原始文件内容不被修改。
+
+音乐刮削补写标签或内嵌封面时，如果本地目标是硬链接或软链接，会先写入独立副本，
+全部成功后原子替换目标；源文件字节与权限保持不变。实际发生写入后，目标成为普通文件，
+会独立占用磁盘空间。未发生标签变化且没有其它写入时保留原链接；跳过标签及封面可保持链接整理。
+写入失败或目标在处理期间改变时，丢弃临时副本，不覆盖原目标。LRC 与 Lyricsfile 旁挂也按目录项原子替换。
+WAV、DSF 和 MP3 使用原生 ID3 帧，MP4/M4A 使用标准 atom 及文本 freeform；无标签音频可直接补写，
+错误扩展名按实际容器处理。Recording、Release、Release Group、Release Track ID 分别写入专用标签；
+仅有首发年份时只写原始年份标签，不能据此生成当前发行日期；已有同年的完整日期不因模型只携带年份而截断。
+APEv2 按[标准标签映射](https://picard-docs.musicbrainz.org/en/latest/appendices/tag_mapping.html)
+使用下划线形式的 MusicBrainz 字段和 `Originalyear`，不套用 ID3 的带空格描述；读取仍兼容旧字段别名。
+
+音乐整理按每个文件的 `storage` 决定证据来源：远端仅使用名称、目录和原始种子线索，
+不读取本机同路径的标签、时长或 CUE。仅有 `.m4a` 扩展名时不声明 AAC/ALAC 或有损/无损。
+明确按音乐整理的镜像（如 ISO）及压缩包会返回先提取/解压的失败提示，不执行自动转换。
+明确按影视整理的附加音轨不继承旧音乐历史身份。
+
+专辑曲目按身份、曲名、碟号/曲序与时长的唯一证据对位，不按文件排序补齐未匹配曲目。
+编号文件名可由位置或唯一时长补全，真实标签中的数字曲名仍作为名称证据。
+重复版本、同分候选和明显时长冲突保留未匹配；手选发行允许按唯一位置纠正旧曲名，
+但不绕过时长冲突。手选批次不能完整对位时会在文件操作前返回核对提示。
+
+目录匹配优先直查明确的 `musicbrainz_release_id`，`musicbrainz_release_group_id` 只约束发行搜索。
+普通 `Music`/`inbox` 等目录名不作为专辑名；真实标签或种子明确给出的同名作品仍可搜索。
+曲名反查使用 MusicBrainz 的 Recording 搜索及其关联发行；Release 搜索不支持 `recording` 字段。
+同等搜索相关度优先检查被多首录音共同命中的发行，避免单曲的多个版本占满候选预算。
+候选必须覆盖全部本地逻辑曲目；部分下载不要求覆盖远端专辑的全部歌曲。
+身份、当前发行年和明确艺人冲突不能靠其它分数抵消；原始年份只辅助排名。
+不同录音序列的近分候选不自动采用，同发行组且录音序列相同的地区/文字版本沿用用户偏好。
+匹配成功时 `raw_data.match_score` 是 0–100 的排序分数，不是概率；`match_coverage=1` 仅表示当前输入文件全覆盖。
+整轨 CUE 以逻辑歌曲数和相邻索引时长参与匹配，返回仍为物理文件的专辑身份；修改 CUE 会使目录缓存失效。
+
+来源识别默认最多 8 次 HTTP 尝试，等待与请求超时按 45 秒预算约束，HTTP 缓存命中不消耗请求额度。
+无匹配与服务故障分开处理：目录成功结果缓存一小时，无匹配缓存五分钟，服务故障仅冷却十五秒；
+无身份的 MusicBrainz 元数据负缓存最多五分钟，连接失败或预算耗尽不写成这种负缓存。
+`MusicInfo.raw_data.recognition` 可携带 `status`、`message`、`requests`、`candidates` 诊断。
+`ambiguous`、`conflict`、`service_error`、`budget_exhausted` 均不能冒充远端匹配成功；整理规划遇到这些状态时停止文件操作，
+歧义不再回退为逐曲猜测。目录结果在 Python 调用方中保持字典兼容，并额外保留 `recognition` 属性。
+音乐缓存删除/清空同时清理来源响应及目录状态；刷新前进行中的目录查询不能回填刷新后的缓存。
+同一整理批次复用有界只读音频/CUE快照；文件指纹变化、批次退出都会失效，不缓存可写音频对象。
+
+尚未生成文件计划的 `service_error` / `budget_exhausted` 会保留持久准入，30秒后重新识别，
+重试上限沿用整理失败重试策略。恢复读取最初选中的发行范围和发行偏好，不能直接复用旧失败媒体信息。
+预算耗尽后正常记录失败；手动重试已结算的零文件操作音乐拒绝，可在事务中创建新的识别任务，
+原失败历史及结算回执保留。任何带文件操作、兼容 provider 操作或不确定证据的计划继续原有执行重放，不能自动重规划目标。
+这个等待状态表示任务仍在处理中，不能作为文件整理完成的证据。
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
@@ -395,7 +598,7 @@ SSE 的 `candidate_items` 是站点原始返回数量，`match_counts` 记录身
 | GET | `/api/v1/recommend/music_weekly` | 浏览本周热门音乐，参数：`page`、`count` |
 | GET | `/api/v1/recommend/music_douban` | 浏览豆瓣音乐新碟榜，参数：`page`、`count` |
 
-专辑下载与订阅按“整包”处理：下载层会读取种子文件清单并以专辑 `total_tracks` 校验独立音频文件数量；未确认完整覆盖时不会把专辑订阅销订，也不会把部分曲目报告为完整专辑已入库。音乐整理会迁移与音轨同目录、同主干名的 `.lrc`、`.txt` 和 `.lyricsfile.yaml` 旁挂歌词。音乐刮削默认使用“质量升级”策略：先读取已有旁挂和 MP3/FLAC/Ogg/MP4 内嵌歌词，再聚合插件、LRCLIB、AMLL TTML 和 TheAudioDB 纯文本候选；逐字 Lyricsfile、逐行同步 LRC、纯文本依次降级，任何覆盖入口都不会用低质量结果替换高质量歌词。Lyricsfile 会保留为 `.lyricsfile.yaml`，同时生成播放器兼容的 `.lrc`。
+专辑下载与订阅按“累计曲目”处理：下载层读取种子文件清单并记录可识别的独立音轨，允许不完整资源先进入下载；活动订阅跨轮次合并去重，API 返回 `completed_tracks`，达到 `total_tracks` 后才完成订阅。媒体库完整性检查仍要求本地专辑具备完整曲目。音乐整理会迁移与音轨同目录、同主干名的 `.lrc`、`.txt` 和 `.lyricsfile.yaml` 旁挂歌词。音乐刮削默认使用“质量升级”策略：先读取已有旁挂和 MP3/FLAC/Ogg/MP4 内嵌歌词，再聚合插件、LRCLIB、AMLL TTML 和 TheAudioDB 纯文本候选；逐字 Lyricsfile、逐行同步 LRC、纯文本依次降级，任何覆盖入口都不会用低质量结果替换高质量歌词。Lyricsfile 会保留为 `.lyricsfile.yaml`，同时生成播放器兼容的 `.lrc`。
 
 AMLL 使用无需鉴权的原生搜索与获取接口，先尝试 ISRC，再核对完整曲名、艺术家和已有专辑；搜索最多读取 20 项并下载 3 个匹配候选。TTML 只转换主唱内容，排除翻译、音译和背景人声；可靠的逐词或逐行时轴会保留，缺乏完整行时轴时降为纯文本。`AMLL_BASE_URL` 可配置兼容实例地址，网络超时为 10 秒，限流时进入最多 300 秒的有界冷却。动态搜索和 ISRC 查询缓存 1 小时，固定 ID 歌词缓存 7 天，未命中缓存 5 分钟。接口与格式依据见 [AMLL HTTP API](https://amll.dev/reference/http-api/overview)。
 
@@ -483,6 +686,13 @@ TMDB 缓存查询响应的 `data` 包含 `count`、`recognized`、`unrecognized`
 | `subscription.execution.cancel` | PUT | `/api/v1/subscribe/execution/batches/{batch_id}/cancel` | 在下载副作用边界前请求取消一个批次 |
 
 取消是幂等的状态请求，不会撤销已经提交到下载器的任务；批次详情中的状态和任务结果才是最终事实。
+
+### 跨来源订阅回显
+
+`GET /api/v1/subscribe/media/{media_id}` 先按 `media_source`、`media_id` 和可选季号查询当前用户可访问的订阅。
+影视身份未命中且提供 `mtype`、`title` 时，会按类型、规范标题和可选季号跨来源查找；
+有年份时优先精确年份，其次匹配订阅年份为空的未定档媒体；没有年份时只匹配年份也为空的订阅。
+音乐订阅始终只按媒体身份查询。
 
 ### 单条订阅搜索周期
 
@@ -668,7 +878,7 @@ Agent 自主任务使用数据库中的整数 `task_id`。`scheduler.list` 与 `
 创建每天 20:30 执行的周期任务时，使用 `trigger_type=cron` 和 `trigger="30 20 * * *"`。
 
 `persona` 使用 `action=list|switch|update`。`list` 可按 `query` 过滤；
-`switch` 必须提供 `persona_id`；`update` 只有管理员可用，支持替换 label、
+`switch` 和 `update` 必须提供 `persona_id`，且只有系统管理员可用。`update` 支持替换 label、
 description、aliases、instructions，或通过 `append_instructions` 追加规则。旧的
 `query_personas`、`switch_persona` 和 `update_persona_definition` 不再注册。
 

@@ -54,6 +54,49 @@ def test_send_msg_success(telegram):
     assert result and result.get("success")
 
 
+def test_topic_id_is_scoped_to_channel_and_default_chat(tmp_path):
+    """同一 bot 和群组的不同渠道应各发各的话题，私聊与空配置不带话题参数。"""
+    bots = [MagicMock(), MagicMock(), MagicMock()]
+    for bot in bots:
+        bot.get_me.return_value = SimpleNamespace(username="test_bot")
+        bot.infinity_polling = lambda *args, **kwargs: None
+        bot.stop_polling = lambda *args, **kwargs: None
+    with patch("app.modules.telegram.telegram.TeleBot", side_effect=bots), patch(
+        "app.modules.telegram.telegram.ImageHelper"
+    ):
+        clients = [
+            Telegram(TELEGRAM_TOKEN="same-token", TELEGRAM_CHAT_ID="-1001", TELEGRAM_TOPIC_ID=topic)
+            for topic in ("101", "202", "")
+        ]
+        try:
+            for client, bot, topic in zip(clients, bots, (101, 202, None)):
+                assert client.send_msg(title="", text="通知")["success"]
+                assert bot.send_message.call_args.kwargs.get("message_thread_id") == topic
+                assert client.send_msg(title="", text="私聊", userid="123")["success"]
+                assert "message_thread_id" not in bot.send_message.call_args.kwargs
+
+            assert clients[0].send_msg(title="", rich_message="# 通知")["success"]
+            assert bots[0].send_rich_message.call_args.kwargs["message_thread_id"] == 101
+
+            attachment = tmp_path / "notice.txt"
+            attachment.write_text("通知")
+            assert clients[0].send_file(file_path=str(attachment))["success"]
+            assert bots[0].send_document.call_args.kwargs["message_thread_id"] == 101
+
+            photo = tmp_path / "notice.jpg"
+            photo.write_bytes(b"photo")
+            assert clients[0].send_file(file_path=str(photo))["success"]
+            assert bots[0].send_photo.call_args.kwargs["message_thread_id"] == 101
+
+            voice = tmp_path / "notice.ogg"
+            voice.write_bytes(b"voice")
+            assert clients[0].send_voice(voice_path=str(voice))["success"]
+            assert bots[0].send_voice.call_args.kwargs["message_thread_id"] == 101
+        finally:
+            for client in clients:
+                client.stop()
+
+
 def test_edit_msg_with_rich_message(telegram):
     """Telegram 流式编辑应继续使用 Rich Message 协议。"""
     telegram._bot.edit_message_text.return_value = SimpleNamespace(message_id=101)
@@ -104,6 +147,7 @@ def test_telegram_parser_preserves_reply_to_message_id():
     assert message.chat_id == "10001"
     assert message.reply_to_message_id == 99
 
+
 def test_send_msg_with_longtext(telegram):
     """测试发送长消息"""
     result = telegram.send_msg(
@@ -140,6 +184,7 @@ def test_send_medias_msg_success(telegram):
 
     assert result
 
+
 def test_send_medias_msg_without_vote_average(telegram):
     """测试发送无评分的媒体列表消息"""
     # 创建模拟的媒体信息列表（无评分）
@@ -157,6 +202,7 @@ def test_send_medias_msg_without_vote_average(telegram):
     )
 
     assert result
+
 
 def test_send_medias_msg_with_link_and_buttons(telegram):
     """测试发送带链接和按钮的媒体列表消息"""
@@ -182,7 +228,6 @@ def test_send_medias_msg_with_link_and_buttons(telegram):
     )
 
     assert result
-
 
 
 def test_send_torrents_msg_success(telegram):
@@ -219,6 +264,7 @@ def test_send_torrents_msg_success(telegram):
     )
 
     assert result
+
 
 def test_send_torrents_msg_with_link_and_buttons(telegram):
     """测试发送带链接和按钮的种子列表消息"""
@@ -260,6 +306,7 @@ def test_send_torrents_msg_with_link_and_buttons(telegram):
 
     assert result
 
+
 def test_send_msg_with_buttons_and_link(telegram):
     """测试发送带按钮和链接的消息"""
     buttons = [[
@@ -275,6 +322,7 @@ def test_send_msg_with_buttons_and_link(telegram):
 
     # 验证返回值：send_msg 失败时返回 {"success": False}（非空字典），故显式断言 success
     assert result and result.get("success")
+
 
 def test_send_msg_with_url_buttons(telegram):
     """测试发送带URL按钮的消息"""

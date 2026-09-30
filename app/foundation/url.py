@@ -1,9 +1,10 @@
 import mimetypes
 import re
 from pathlib import Path
-from typing import Optional, Union, Tuple
+from typing import Iterable, Optional, Union, Tuple
 from urllib import parse
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+
 
 class UrlUtils:
     """提供不发起网络请求的 URL 解析与组合能力。"""
@@ -99,7 +100,6 @@ class UrlUtils:
         except Exception:
             return None
 
-
     @staticmethod
     def get_mime_type(path_or_url: Union[str, Path], default_type: str = "application/octet-stream") -> str:
         """
@@ -165,6 +165,18 @@ class UrlUtils:
             return protocol, hostname, port, path
         except Exception:
             return None
+
+
+def url_matches_trusted_hosts(url: str, trusted_hosts: Iterable[str]) -> bool:
+    """判断 HTTP(S) URL 的网络位置或主机名是否精确匹配受信主机。"""
+    try:
+        parsed_url = urlparse(url)
+    except ValueError:
+        return False
+    if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.hostname:
+        return False
+    trusted = {host.lower() for host in trusted_hosts}
+    return parsed_url.netloc.lower() in trusted or parsed_url.hostname.lower() in trusted
 
 
 def split_netloc(url: str) -> Tuple[str, str]:

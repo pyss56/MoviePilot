@@ -2,10 +2,10 @@
   "disposition_counts": {
     "alternate-auth-duplicate": 11,
     "consolidated": 71,
-    "gateway": 218,
+    "gateway": 228,
     "provider-skill": 12,
     "stream_or_binary": 10,
-    "transport_or_identity": 66,
+    "transport_or_identity": 76,
     "ui_presentation": 13
   },
   "dynamic_gateway_routes": [
@@ -18,10 +18,10 @@
       "reason": "The executor validates and expands this bounded source placeholder to one of tmdb, douban, bangumi, or anilist before calling the corresponding concrete OpenAPI route."
     }
   ],
-  "gateway_http_route_count": 219,
-  "gateway_operation_count": 221,
-  "matched_gateway_http_route_count": 218,
-  "openapi_operation_count": 401,
+  "gateway_http_route_count": 229,
+  "gateway_operation_count": 231,
+  "matched_gateway_http_route_count": 228,
+  "openapi_operation_count": 421,
   "operations": [
     {
       "disposition": "consolidated",
@@ -754,6 +754,66 @@
       ]
     },
     {
+      "disposition": "transport_or_identity",
+      "method": "POST",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/github/auth/manual",
+      "reason": "GitHub Token authorization and first-run credential setup are host identity/configuration flows; they are not Agent business actions.",
+      "summary": "保存手动 GitHub Token",
+      "tags": [
+        "github"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "POST",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/github/auth/poll",
+      "reason": "GitHub Token authorization and first-run credential setup are host identity/configuration flows; they are not Agent business actions.",
+      "summary": "轮询 GitHub 设备授权",
+      "tags": [
+        "github"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "POST",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/github/auth/start",
+      "reason": "GitHub Token authorization and first-run credential setup are host identity/configuration flows; they are not Agent business actions.",
+      "summary": "启动 GitHub 设备授权",
+      "tags": [
+        "github"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "GET",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/github/auth/status",
+      "reason": "GitHub Token authorization and first-run credential setup are host identity/configuration flows; they are not Agent business actions.",
+      "summary": "查询 GitHub Token 状态",
+      "tags": [
+        "github"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "DELETE",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/github/auth/token",
+      "reason": "GitHub Token authorization and first-run credential setup are host identity/configuration flows; they are not Agent business actions.",
+      "summary": "清除 GitHub Token",
+      "tags": [
+        "github"
+      ]
+    },
+    {
       "disposition": "gateway",
       "method": "DELETE",
       "operation_ids": [
@@ -907,6 +967,66 @@
       "path": "/api/v1/login/access-token",
       "reason": "Authentication, protocol compatibility, conversation transport, callback, or account lifecycle endpoint; never recursively exposed as an Agent business action.",
       "summary": "获取token",
+      "tags": [
+        "login"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "POST",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/login/github-auth/manual",
+      "reason": "Authentication, protocol compatibility, conversation transport, callback, or account lifecycle endpoint; never recursively exposed as an Agent business action.",
+      "summary": "从初始化页保存手动 GitHub Token",
+      "tags": [
+        "login"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "POST",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/login/github-auth/poll",
+      "reason": "Authentication, protocol compatibility, conversation transport, callback, or account lifecycle endpoint; never recursively exposed as an Agent business action.",
+      "summary": "从初始化页轮询 GitHub 设备授权",
+      "tags": [
+        "login"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "POST",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/login/github-auth/start",
+      "reason": "Authentication, protocol compatibility, conversation transport, callback, or account lifecycle endpoint; never recursively exposed as an Agent business action.",
+      "summary": "从初始化页启动 GitHub 设备授权",
+      "tags": [
+        "login"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "GET",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/login/github-auth/status",
+      "reason": "Authentication, protocol compatibility, conversation transport, callback, or account lifecycle endpoint; never recursively exposed as an Agent business action.",
+      "summary": "查询初始化阶段 GitHub Token 状态",
+      "tags": [
+        "login"
+      ]
+    },
+    {
+      "disposition": "transport_or_identity",
+      "method": "DELETE",
+      "operation_ids": [],
+      "owner": "host-runtime",
+      "path": "/api/v1/login/github-auth/token",
+      "reason": "Authentication, protocol compatibility, conversation transport, callback, or account lifecycle endpoint; never recursively exposed as an Agent business action.",
+      "summary": "从初始化页清除 GitHub Token",
       "tags": [
         "login"
       ]
@@ -2040,6 +2160,20 @@
       ]
     },
     {
+      "disposition": "gateway",
+      "method": "GET",
+      "operation_ids": [
+        "plugin.clone.restorable"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/plugin/clone/{plugin_id}/restorable",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "列出可恢复的已停用分身",
+      "tags": [
+        "plugin"
+      ]
+    },
+    {
       "disposition": "ui_presentation",
       "method": "GET",
       "operation_ids": [],
@@ -2251,6 +2385,104 @@
       "path": "/api/v1/plugin/installed",
       "reason": "This compatibility, broader-response, or UI route is represented by the safer stable operation plugin.installed.",
       "summary": "已安装插件",
+      "tags": [
+        "plugin"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "POST",
+      "operation_ids": [
+        "plugin.instance.set_enabled"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/plugin/instance/{instance_id}/enabled",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "启用或停用插件实例",
+      "tags": [
+        "plugin"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "POST",
+      "operation_ids": [
+        "plugin.instance.purge"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/plugin/instance/{instance_id}/purge",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "按选定范围彻底清理插件实例",
+      "tags": [
+        "plugin"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "DELETE",
+      "operation_ids": [
+        "plugin.default_target.clear"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/plugin/instances/{plugin_id}/{instance_id}/default_target",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "清除插件实例的默认调用目标",
+      "tags": [
+        "plugin"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "PUT",
+      "operation_ids": [
+        "plugin.default_target.set"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/plugin/instances/{plugin_id}/{instance_id}/default_target",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "设置插件实例的默认调用目标",
+      "tags": [
+        "plugin"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "GET",
+      "operation_ids": [
+        "plugin.loglevel.get"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/plugin/loglevel/{plugin_id}",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "查询插件全部实例的日志等级设置",
+      "tags": [
+        "plugin"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "DELETE",
+      "operation_ids": [
+        "plugin.loglevel.clear"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/plugin/loglevel/{plugin_id}/{instance_id}",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "清除插件实例的日志等级覆盖",
+      "tags": [
+        "plugin"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "PUT",
+      "operation_ids": [
+        "plugin.loglevel.set"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/plugin/loglevel/{plugin_id}/{instance_id}",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "设置插件实例的日志等级覆盖",
       "tags": [
         "plugin"
       ]
@@ -4461,6 +4693,34 @@
       "path": "/api/v1/system/settings",
       "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
       "summary": "Update one registered system setting",
+      "tags": [
+        "system"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "GET",
+      "operation_ids": [
+        "config.system.list"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/system/settings/catalog",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "List system setting contracts",
+      "tags": [
+        "system"
+      ]
+    },
+    {
+      "disposition": "gateway",
+      "method": "GET",
+      "operation_ids": [
+        "config.system.describe"
+      ],
+      "owner": "moviepilot-api",
+      "path": "/api/v1/system/settings/describe/{setting_key}",
+      "reason": "Executable through moviepilot_api; exact inputs are generated into MCP tools/list and SKILL.md.",
+      "summary": "Describe one system setting contract",
       "tags": [
         "system"
       ]

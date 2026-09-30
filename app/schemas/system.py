@@ -62,7 +62,7 @@ class MediaServerConf(BaseModel):
                 return None
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
 
 
@@ -190,6 +190,16 @@ class SystemSettingsUpdateRequest(BaseModel):  # type: ignore[misc]
         default=None,
         description="Value compared against match_field. If omitted, use value[match_field]; scalar lists use value directly.",
     )
+    expected_revision: Optional[str] = Field(
+        description=(
+            "Optional revision returned by config.system.describe or config.system.get for this exact setting. "
+            "When supplied, the update is rejected if another writer changed the setting after that read. "
+            "New Agent clients should always provide it."
+        ),
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
 
 
 class CustomIdentifiersUpdateRequest(BaseModel):  # type: ignore[misc]
@@ -308,9 +318,12 @@ class RuleTestData(BaseModel):
 class NetTestTarget(BaseModel):
     """前端可选择的网络测试目标。"""
 
-    id: str
-    name: str
-    icon: str
+    id: str = Field(description="Stable identifier used to run the approved network test.")
+    name: str = Field(description="Short description of the tested function or service.")
+    address: str = Field(
+        description="Sanitized destination origin; paths, query parameters, and credentials are omitted."
+    )
+    icon: str = Field(description="Frontend logo key for the tested service.")
 
 
 class SystemModuleInfo(BaseModel):

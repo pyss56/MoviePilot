@@ -35,6 +35,10 @@ def extract_domain(url: str) -> str:
     _scheme, netloc = split_netloc(url)
     if not netloc:
         return ""
+    # Cookie Domain 常带前导点；不去掉会被当成多一级域名，无法并入站点域名。
+    netloc = netloc.lstrip(".")
+    if not netloc:
+        return ""
     labels = netloc.split(".")
     if len(labels) > 3:
         return netloc
@@ -53,7 +57,6 @@ def resolve_page_url(site_url: str, page_path: Optional[str]) -> str:
 
 class SiteUtils:
     """提供站点域名、Cookie 和访问参数处理能力。"""
-
 
     @classmethod
     def is_logged_in(cls, html_text: str) -> bool:

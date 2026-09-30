@@ -230,6 +230,65 @@ def _is_deepseek_thinking_enabled(model_name: str | None, extra_body: Any) -> bo
     return False
 
 
+# Anthropic 分块协议及其兼容别名：这些分块承载供应商思考协议，
+# LangChain 在还原请求时会整体丢弃，需要兼容层原样回传。
+_THINKING_CONTENT_BLOCK_TYPES = frozenset(
+    {"thinking", "redacted_thinking", "reasoning", "reasoning_content"}
+)
+
+
+def _is_thinking_content_block(value: Any) -> bool:
+    """识别承载供应商思考协议的内容分块。"""
+    return (
+        isinstance(value, dict)
+        and str(value.get("type") or "").strip().lower()
+        in _THINKING_CONTENT_BLOCK_TYPES
+    )
+
+
+def _extract_thinking_content_blocks(content: Any) -> list[dict[str, Any]]:
+    """
+    提取内容数组中的思考分块。
+
+    部分兼容端点沿用 Anthropic 分块协议，把思考内容放在 assistant
+    `content[].thinking`，并要求后续请求原样回传；分块里的签名字段
+    由端点校验，必须按原样保留，不能在重建时丢弃或合并。
+    """
+    if not isinstance(content, list):
+        return []
+    return [dict(block) for block in content if _is_thinking_content_block(block)]
+
+
+def _restore_thinking_content_blocks(
+        payload_message: dict[str, Any],
+        message: AIMessage,
+) -> None:
+    """
+    把历史响应中的思考分块回填到续轮请求。
+
+    LangChain 在还原请求时会过滤 `thinking`/`reasoning` 分块，这里按
+    分块协议放回 assistant 内容最前，保持端点返回时的顺序；流式聚合
+    产生的裸字符串正文统一转成文本分块，避免混排分块被端点拒绝。
+    """
+    thinking_blocks = _extract_thinking_content_blocks(message.content)
+    if not thinking_blocks:
+        return
+
+    content = payload_message.get("content")
+    if isinstance(content, list):
+        text_blocks = [
+            {"type": "text", "text": block} if isinstance(block, str) else block
+            for block in content
+            if not _is_thinking_content_block(block)
+        ]
+    elif content:
+        text_blocks = [{"type": "text", "text": str(content)}]
+    else:
+        text_blocks = []
+
+    payload_message["content"] = [*thinking_blocks, *text_blocks]
+
+
 def _patch_interleaved_reasoning_request_support(
         model_cls: Any,
         *,
@@ -238,7 +297,7 @@ def _patch_interleaved_reasoning_request_support(
         normalize_deepseek_messages: bool = False,
         inject_missing_as_empty: bool = False,
 ) -> None:
-    """为兼容模型统一补回工具调用历史中的 reasoning_content。"""
+    """为兼容模型统一补回工具调用历史中的 reasoning_content 和思考分块。"""
     if getattr(model_cls, patch_marker, False):
         return
 
@@ -284,8 +343,12 @@ def _patch_interleaved_reasoning_request_support(
                     payload_message.get("role") != "assistant"
                     or index >= len(messages)
                     or not isinstance(messages[index], AIMessage)
-                    or "reasoning_content" in payload_message
             ):
+                continue
+
+            _restore_thinking_content_blocks(payload_message, messages[index])
+
+            if "reasoning_content" in payload_message:
                 continue
 
             reasoning_content = messages[index].additional_kwargs.get(
@@ -307,11 +370,14 @@ def _patch_openai_interleaved_reasoning_content_support():
     修补 OpenAI-compatible 模型的 interleaved reasoning 内容回传。
 
     小米 MiMo、部分 Kimi/GLM 等兼容端点会把思考内容放在响应顶层
-    `reasoning_content` 字段；如果下一轮请求没有把它随历史 assistant
-    消息带回，工具调用后续请求会被服务端以 400 拒绝。
+    `reasoning_content` 字段；DeepSeek 中转网关等端点则沿用 Anthropic
+    分块协议，把思考内容放在响应 `content[].thinking` 分块中。如果下一轮
+    请求没有把它们随历史 assistant 消息带回，工具调用后续请求会被服务端
+    以 400 拒绝。
 
     这里不按 provider 白名单判断，而是只在历史 AIMessage 真实保存过
-    `reasoning_content` 时回传，避免以后每接入一个同类模型都要单独适配。
+    `reasoning_content` 或思考分块时回传，避免以后每接入一个同类模型
+    都要单独适配。
     """
     try:
         import langchain_openai.chat_models.base as _openai_base
@@ -404,7 +470,7 @@ def _patch_openai_responses_instructions_support():
 
         # 处理 ChatGPT 官方 Responses API (Codex) 端点兼容性
         is_codex = "chatgpt.com/backend-api/codex" in base_url
-        
+
         if is_codex and (getattr(self, "use_responses_api", False) or "input" in payload):
             instructions = payload.get("instructions", "")
             inputs = payload.get("input", [])
@@ -424,10 +490,10 @@ def _patch_openai_responses_instructions_support():
             payload["input"] = new_inputs
             payload["instructions"] = instructions or "You are a helpful assistant."
             payload["store"] = False
-            
+
             # Codex 端点不支持的部分常见补全参数，统一清理避免 400 报错
             unsupported_keys = [
-                "presence_penalty", "frequency_penalty", "top_p", "n", "user", 
+                "presence_penalty", "frequency_penalty", "top_p", "n", "user",
                 "stop", "metadata", "logit_bias", "logprobs", "top_logprobs",
                 "stream_options", "temperature"
             ]
@@ -499,10 +565,155 @@ def _patch_openai_responses_empty_output_support():
     logger.debug("已修补 langchain-openai responses API 空 output 兼容性")
 
 
+_SCHEMA_MAP_KEYWORDS = frozenset({"properties", "$defs", "definitions"})
+_SCHEMA_LIST_KEYWORDS = frozenset({"anyOf", "oneOf", "allOf"})
+_SCHEMA_NODE_KEYWORDS = frozenset({"items", "additionalProperties"})
+_SCHEMA_UNION_KEYWORDS = ("anyOf", "oneOf")
+
+
+def _schema_variant_type(variant: Any) -> str | None:
+    """返回联合分支声明的单一 JSON 类型，无法确定时返回 None。"""
+    schema_type = variant.get("type") if isinstance(variant, dict) else None
+    return schema_type if isinstance(schema_type, str) else None
+
+
+def _collapse_schema_union(schema: dict[str, Any], *, gemini_compatible: bool) -> dict[str, Any]:
+    """把不带顶层 type 的 anyOf/oneOf 折叠为单一分支，字段级关键字优先保留。"""
+    if "type" in schema:
+        return schema
+    for keyword in _SCHEMA_UNION_KEYWORDS:
+        variants = schema.get(keyword)
+        if not isinstance(variants, list):
+            continue
+        candidates = [variant for variant in variants if _schema_variant_type(variant) != "null"]
+        candidate_types = {_schema_variant_type(variant) for variant in candidates}
+        single_type = len(candidate_types) == 1 and None not in candidate_types
+        if not candidates or not (single_type or gemini_compatible):
+            return schema
+        chosen = next(
+            (variant for variant in candidates if _schema_variant_type(variant)),
+            candidates[0],
+        )
+        field_keywords = {key: value for key, value in schema.items() if key != keyword}
+        return {**(chosen if isinstance(chosen, dict) else {}), **field_keywords}
+    return schema
+
+
+def _infer_gemini_schema_type(schema: dict[str, Any]) -> dict[str, Any]:
+    """为 Gemini 补齐无法从联合推断类型的节点，默认 string 与原生转换一致。"""
+    if "type" in schema or any(key in schema for key in ("$ref", *_SCHEMA_LIST_KEYWORDS)):
+        return schema
+    if "properties" in schema:
+        return {**schema, "type": "object"}
+    if "items" in schema:
+        return {**schema, "type": "array"}
+    return {**schema, "type": "string"}
+
+
+def _normalize_tool_schema(schema: Any, *, gemini_compatible: bool) -> Any:
+    """
+    返回规整后的工具参数 JSON Schema 副本，不修改入参。
+
+    所有模型：anyOf/oneOf 的非 null 分支只有一种类型时折叠为该类型，保留字段级
+    描述与默认值；参数仍由工具的 Pydantic 模型校验，省略可选字段与传 null 等价。
+    Gemini 模型：其函数声明要求每个节点都带 type 且不支持 additionalProperties，
+    多类型联合取首个非 null 分支、丢弃 schema 形式的 additionalProperties、无法
+    推断类型的节点按 string 处理，与 langchain-google-genai 的原生转换保持一致。
+
+    :param schema: 工具参数 schema 节点，非字典节点原样返回
+    :param gemini_compatible: 是否输出 Gemini 函数声明可接受的 schema
+    :return: 规整后的新 schema
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    def _normalize(child: Any) -> Any:
+        return _normalize_tool_schema(child, gemini_compatible=gemini_compatible)
+
+    normalized: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            normalized[key] = {name: _normalize(child) for name, child in value.items()}
+        elif key in _SCHEMA_LIST_KEYWORDS and isinstance(value, list):
+            normalized[key] = [_normalize(child) for child in value]
+        elif key in _SCHEMA_NODE_KEYWORDS and isinstance(value, dict):
+            if gemini_compatible and key == "additionalProperties":
+                continue
+            normalized[key] = _normalize(value)
+        else:
+            normalized[key] = value
+    normalized = _collapse_schema_union(normalized, gemini_compatible=gemini_compatible)
+    return _infer_gemini_schema_type(normalized) if gemini_compatible else normalized
+
+
+def _normalize_function_tool(tool: Any, *, gemini_compatible: bool) -> Any:
+    """规整 Chat Completions 或 Responses 格式的函数工具；strict 工具保持原样。"""
+    if not isinstance(tool, dict) or tool.get("type") != "function":
+        return tool
+    function = tool.get("function")
+    definition = function if isinstance(function, dict) else tool
+    parameters = definition.get("parameters")
+    if definition.get("strict") is True or not isinstance(parameters, dict):
+        return tool
+    normalized = {
+        **definition,
+        "parameters": _normalize_tool_schema(parameters, gemini_compatible=gemini_compatible),
+    }
+    return {**tool, "function": normalized} if definition is function else normalized
+
+
+def _patch_tool_schema_request_support(model_cls: Any, *, patch_marker: str) -> None:
+    """
+    为 OpenAI 兼容模型在请求上线前规整函数工具的参数 schema。
+
+    Pydantic 为 Optional[T] 字段生成不带顶层 type 的 anyOf；把 OpenAI tools 转成
+    Gemini functionDeclaration 的网关不处理 anyOf，整次请求会因字段缺少 type 被
+    400 拒绝。在请求构造出口统一规整，可覆盖主 Agent、子代理与内部模型调用的
+    全部工具，且不修改已绑定的工具定义。
+
+    :param model_cls: 需要修补的 ChatOpenAI 兼容模型类
+    :param patch_marker: 记录已修补状态的类属性名
+    """
+    if getattr(model_cls, patch_marker, False):
+        return
+    original_get_request_payload = getattr(model_cls, "_get_request_payload", None)
+    if not callable(original_get_request_payload):
+        logger.debug(f"{model_cls.__name__} 缺少 _get_request_payload，跳过工具 schema 规整")
+        return
+
+    @wraps(original_get_request_payload)
+    def _patched_get_request_payload(self: Any, input_: Any, *, stop: Any = None, **kwargs: Any) -> Any:
+        payload = original_get_request_payload(self, input_, stop=stop, **kwargs)
+        tools = payload.get("tools") if isinstance(payload, dict) else None
+        if not isinstance(tools, list):
+            return payload
+        model_name = getattr(self, "model_name", None) or getattr(self, "model", None)
+        gemini_compatible = "gemini" in str(model_name or "").lower()
+        return {
+            **payload,
+            "tools": [
+                _normalize_function_tool(tool, gemini_compatible=gemini_compatible)
+                for tool in tools
+            ],
+        }
+
+    setattr(model_cls, "_get_request_payload", _patched_get_request_payload)
+    setattr(model_cls, patch_marker, True)
+
+
 class LLMHelper:
     """LLM模型相关辅助功能"""
 
     _DEFAULT_MAX_INPUT_TOKENS = 256_000
+    _OPENAI_REASONING_EFFORT_ORDER = (
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    )
 
     @staticmethod
     def _positive_token_limit(value: Any) -> int | None:
@@ -525,7 +736,7 @@ class LLMHelper:
             model_profile: Any,
             runtime: dict[str, Any],
     ) -> dict[str, Any]:
-        """把当前端点的窗口事实合并到 LangChain model profile。"""
+        """合并窗口事实，未匹配端点仅在无有效配置时使用 256K 回退。"""
         profile = dict(model_profile) if isinstance(model_profile, dict) else {}
         model_record = runtime.get("model_record") or {}
         model_metadata = runtime.get("model_metadata") or {}
@@ -565,10 +776,11 @@ class LLMHelper:
                     metadata_input,
                     profile_input,
                     configured_input,
-                    cls._DEFAULT_MAX_INPUT_TOKENS,
                 )
                 if candidate is not None
             ]
+            if configured_input is None:
+                constraints.append(cls._DEFAULT_MAX_INPUT_TOKENS)
             max_input_tokens = min(constraints)
         profile["max_input_tokens"] = max_input_tokens
 
@@ -621,18 +833,86 @@ class LLMHelper:
 
     @classmethod
     def _normalize_openai_reasoning_effort(
-            cls, thinking_level: str | None = None
+            cls,
+            thinking_level: str | None = None,
+            supported_efforts: set[str] | None = None,
     ) -> str | None:
         """
-        OpenAI reasoning_effort 支持更细粒度的 effort，统一做最近似映射。
+        将统一思考级别映射为 OpenAI reasoning_effort。
+
+        :param thinking_level: MoviePilot 统一思考级别
+        :param supported_efforts: 模型目录声明的可用 effort，未知时不限制
+        :return: 可发送的 reasoning_effort；不支持时返回 None
         """
         if not thinking_level or thinking_level == "auto":
             return None
         if thinking_level == "off":
-            return "none"
-        if thinking_level == "max":
-            return "xhigh"
-        return thinking_level
+            normalized_effort = "none"
+        elif thinking_level == "max":
+            normalized_effort = "xhigh"
+        else:
+            normalized_effort = thinking_level
+
+        if supported_efforts is None or normalized_effort in supported_efforts:
+            return normalized_effort
+        if normalized_effort == "none":
+            return None
+
+        effort_order = cls._OPENAI_REASONING_EFFORT_ORDER
+        try:
+            requested_index = effort_order.index(normalized_effort)
+        except ValueError:
+            return None
+
+        supported_indexes = [
+            effort_order.index(effort)
+            for effort in supported_efforts
+            if effort in effort_order and effort != "none"
+        ]
+        if not supported_indexes:
+            return None
+
+        lower_or_equal = [index for index in supported_indexes if index <= requested_index]
+        if lower_or_equal:
+            return effort_order[max(lower_or_equal)]
+        return effort_order[min(supported_indexes)]
+
+    @staticmethod
+    def _resolve_openai_reasoning_efforts(
+            model_metadata: Any,
+    ) -> set[str] | None:
+        """
+        从模型目录元数据提取 OpenAI reasoning_effort 能力。
+
+        返回 None 表示目录没有提供可判断的能力信息，空集合表示已明确
+        声明模型不支持 effort 控制。
+        """
+        if not isinstance(model_metadata, dict):
+            return None
+
+        if "reasoning_options" not in model_metadata:
+            if model_metadata.get("reasoning") is False:
+                return set()
+            return None
+
+        raw_options = model_metadata.get("reasoning_options")
+        if raw_options is None:
+            return set()
+        if not isinstance(raw_options, list):
+            return None
+
+        efforts: set[str] = set()
+        for option in raw_options:
+            if not isinstance(option, dict) or option.get("type") != "effort":
+                continue
+            values = option.get("values") or []
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                normalized_value = str(value or "").strip().lower()
+                if normalized_value:
+                    efforts.add(normalized_value)
+        return efforts
 
     @classmethod
     def _build_google_thinking_kwargs(
@@ -715,7 +995,8 @@ class LLMHelper:
             cls,
             provider: str,
             model: str | None,
-            thinking_level: str | None = None
+            thinking_level: str | None = None,
+            model_metadata: Any = None,
     ) -> dict[str, Any]:
         """
         按 provider/model 生成思考模式相关参数。
@@ -746,14 +1027,36 @@ class LLMHelper:
         if not model_name:
             return {}
 
-        # OpenAI 原生推理模型优先走 LangChain 内置 reasoning_effort。
-        if provider_name in {"openai", "chatgpt"} and model_name.startswith(
-                ("gpt-5", "o1", "o3", "o4")
-        ):
+        # OpenAI-compatible 端点的模型名可能是用户自定义值，不能用官方模型前缀
+        # 判断能力；已知目录能力优先约束，未知目录则保留兼容端点的透传能力。
+        if provider_name in {"openai", "chatgpt"}:
+            supported_efforts = cls._resolve_openai_reasoning_efforts(model_metadata)
+            if supported_efforts is not None and not supported_efforts:
+                if thinking_level not in {None, "auto", "off"}:
+                    logger.warning(
+                        f"模型 {model_name} 未声明 OpenAI reasoning_effort 能力，"
+                        f"忽略思考级别: {thinking_level}"
+                    )
+                return {}
+
+            requested_effort = cls._normalize_openai_reasoning_effort(thinking_level)
             openai_effort = cls._normalize_openai_reasoning_effort(
-                thinking_level
+                thinking_level,
+                supported_efforts=supported_efforts,
             )
-            return {"reasoning_effort": openai_effort} if openai_effort else {}
+            if not openai_effort:
+                return {}
+            if supported_efforts is None:
+                logger.debug(
+                    f"模型 {model_name} 未找到 reasoning_options，"
+                    f"按 OpenAI-compatible 约定透传 reasoning_effort: {openai_effort}"
+                )
+            elif requested_effort != openai_effort:
+                logger.warning(
+                    f"模型 {model_name} 不支持思考级别 {thinking_level}，"
+                    f"降级为可用级别: {openai_effort}"
+                )
+            return {"reasoning_effort": openai_effort}
 
         # Gemini 使用 google-genai / langchain-google-genai 内置思考控制参数。
         if provider_name == "google":
@@ -1262,6 +1565,7 @@ class LLMHelper:
             provider=provider_name,
             model=model_name,
             thinking_level=normalized_thinking_level,
+            model_metadata=runtime.get("model_metadata"),
         )
         use_responses_api = cls._should_use_openai_responses_api(
             provider=provider_name,
@@ -1386,7 +1690,11 @@ class LLMHelper:
             from langchain_openai import ChatOpenAI
 
             _patch_openai_responses_instructions_support()
-            
+            _patch_tool_schema_request_support(
+                ChatOpenAI,
+                patch_marker="_moviepilot_tool_schema_patched",
+            )
+
             # ChatGPT Codex 端点强制要求 stream: True
             if runtime.get("use_responses_api") and "chatgpt.com/backend-api/codex" in str(runtime.get("base_url") or ""):
                 streaming = True

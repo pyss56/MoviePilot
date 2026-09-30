@@ -16,7 +16,6 @@ from app.api.dependencies.site import (
     get_site_query_service,
     get_site_sync_query_service,
 )
-from app.api.endpoints.plugin import register_plugin_api
 from app.api.principal import ApiPrincipal
 from app.api.response import (
     COLLECTION_TOTAL_HEADER,
@@ -28,8 +27,10 @@ from app.api.response import (
 )
 from app.application.commands import init_commands
 from app.application.configuration import get_configured_system_config
+from app.application.plugin.routes import register_plugin_api
 from app.application.plugin.runtime import get_plugin_manager
 from app.application.scheduling import get_scheduler
+from app.application.site.auth import normalize_site_auth_params
 from app.application.site.mutation import SiteMutationCommand
 from app.application.site.query import SiteQueryService
 from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
@@ -488,7 +489,14 @@ def refresh_userdata(
         return _SchemaResponse(
             success=False, message="站点不支持索引或未通过用户认证！"
         )
-    user_data = SiteChain().refresh_userdata(site=indexer) or {}
+    user_data = SiteChain().refresh_userdata(site=indexer)
+    if not user_data or not user_data.userid:
+        message = (
+            user_data.err_msg
+            if user_data and user_data.err_msg
+            else "未获取到站点用户数据，请检查 Cookie 是否有效！"
+        )
+        return _SchemaResponse(success=False, message=message)
     return _SchemaResponse(success=True, data=user_data)
 
 
@@ -783,8 +791,18 @@ def auth_site(
     """
     if not auth_info or not auth_info.site or not auth_info.params:
         return _SchemaResponse(success=False, message="请输入认证站点和认证参数")
-    status, msg = SitesHelper().check_user(auth_info.site, auth_info.params)
-    get_configured_system_config().set(SystemConfigKey.UserSiteAuthParams, auth_info.model_dump())
+    sites_helper = SitesHelper()
+    auth_params = normalize_site_auth_params(
+        auth_info.site,
+        auth_info.params,
+        sites_helper.get_authsites(),
+    )
+    status, msg = sites_helper.check_user(auth_info.site, auth_params)
+    if status:
+        get_configured_system_config().set(
+            SystemConfigKey.UserSiteAuthParams,
+            {"site": auth_info.site, "params": auth_params},
+        )
     # 认证成功后，重新初始化插件
     get_plugin_manager().init_config()
     get_scheduler().init_plugin_jobs()

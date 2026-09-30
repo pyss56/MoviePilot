@@ -4,8 +4,10 @@ import errno
 import json
 import threading
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -70,6 +72,40 @@ def test_status_reads_live_auto_update_setting_without_discarding_cached_update(
         assert status.state == "available"
         assert status.version == "v3.1.0"
         assert status.can_update is True
+
+
+def test_sync_docker_dependencies_freezes_lock_for_custom_package_index(
+    monkeypatch, tmp_path
+):
+    """自定义镜像源只替换下载地址，不应触发 uv 重新校验或更新锁文件。"""
+    manager = _docker_manager(monkeypatch, tmp_path)
+    settings = {
+        "TEMP_PATH": tmp_path / "config" / "temp",
+        "ROOT_PATH": tmp_path / "app",
+        "FRONTEND_PATH": tmp_path / "public",
+        "VENV_PATH": tmp_path / "venv",
+        "UV_BIN": tmp_path / "uv",
+        "PIP_PROXY": "https://mirror.example/simple",
+        "PROXY_HOST": "",
+    }
+    monkeypatch.setattr(update_module, "get_runtime_setting", settings.__getitem__)
+    project_dir = tmp_path / "staged"
+    project_dir.mkdir()
+    calls = []
+
+    def run(command, **kwargs):
+        """记录 uv 调用并返回成功结果。"""
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(update_module.subprocess, "run", run)
+
+    assert manager._sync_docker_dependencies(project_dir, force=True) is True
+
+    command = calls[0][0]
+    assert "--frozen" in command
+    assert "--locked" not in command
+    assert command[-2:] == ["--default-index", "https://mirror.example/simple"]
 
 
 @pytest.mark.parametrize("auto_update", [False, True])
@@ -151,6 +187,60 @@ def test_check_logs_when_application_is_current(monkeypatch, tmp_path):
     assert logs == ["MoviePilot 主程序已是最新版本：v3.0.0"]
 
 
+def test_status_refreshes_stale_application_version(monkeypatch, tmp_path):
+    """旧状态文件中的主程序版本应在读取时更新为当前运行版本。"""
+    manager = _manager(monkeypatch, tmp_path)
+    monkeypatch.setattr(update_module, "get_app_version", lambda: "v3.0.0")
+    manager._write_item("application", state="idle")
+
+    monkeypatch.setattr(update_module, "get_app_version", lambda: "v3.0.3")
+    status = manager.get_status()
+    application = next(item for item in status.updates if item.type == "application")
+
+    assert status.current_version == "v3.0.3"
+    assert application.current_version == "v3.0.3"
+
+
+def test_public_download_request_omits_github_authorization(monkeypatch, tmp_path):
+    """公开归档下载不得复用 GitHub API 的认证请求头。"""
+    manager = _manager(monkeypatch, tmp_path)
+    settings = {
+        "TEMP_PATH": tmp_path,
+        "PROXY": {"https": "http://proxy.example:7890"},
+        "GITHUB_HEADERS": {"Authorization": "Bearer github-token"},
+    }
+    monkeypatch.setattr(update_module, "get_runtime_setting", settings.__getitem__)
+    request_utils = Mock()
+    request_utils.return_value.get_stream.return_value = nullcontext(
+        SimpleNamespace(
+            status_code=200,
+            headers={"content-length": "7"},
+            iter_content=lambda **_kwargs: [b"archive"],
+        )
+    )
+    monkeypatch.setattr(update_module, "RequestUtils", request_utils)
+
+    manager._request()
+    destination = tmp_path / "backend.zip"
+    downloaded, content_length = manager._download_file(
+        "https://github.com/jxxghp/MoviePilot/archive/refs/tags/v3.0.2.zip",
+        destination,
+        0,
+        0,
+    )
+
+    assert request_utils.call_args_list == [
+        call(
+            proxies=settings["PROXY"],
+            headers=settings["GITHUB_HEADERS"],
+            timeout=60,
+        ),
+        call(proxies=settings["PROXY"], timeout=60),
+    ]
+    assert downloaded == content_length == 7
+    assert destination.read_bytes() == b"archive"
+
+
 def test_scheduled_check_failure_stays_silent(monkeypatch, tmp_path):
     manager = _manager(monkeypatch, tmp_path)
     monkeypatch.setattr(
@@ -174,6 +264,61 @@ def test_interrupted_download_becomes_retryable_failure(monkeypatch, tmp_path):
     assert status.state == "failed"
     assert status.can_update is True
     assert "中断" in status.error
+
+
+def test_installing_application_update_converges_when_runtime_is_newer(
+    monkeypatch, tmp_path
+):
+    """当前主程序高于残留目标版本时应清理状态并恢复自动检查。"""
+    manager = _manager(monkeypatch, tmp_path)
+    monkeypatch.setattr(update_module, "get_app_version", lambda: "v3.0.6")
+    manager._write_item(
+        "application",
+        state="installing",
+        version="v3.0.1",
+        can_update=False,
+        can_install=False,
+    )
+    checked = []
+    monkeypatch.setattr(manager, "_check_application", lambda: checked.append(True))
+
+    status = manager.check("application")
+
+    application = next(item for item in status.updates if item.type == "application")
+    assert checked == [True]
+    assert application.state == "idle"
+    assert application.version is None
+    assert status.state == "idle"
+
+
+def test_ready_application_update_is_discarded_when_runtime_reaches_target(
+    monkeypatch, tmp_path
+):
+    """外部升级先于确认安装时应清理过期的主程序待安装包。"""
+    manager = _manager(monkeypatch, tmp_path)
+    monkeypatch.setattr(update_module, "get_app_version", lambda: "v3.1.0")
+    manager._merge_prepared_manifest(
+        {
+            "version": "v3.1.0",
+            "backend_archive": "/tmp/backend.zip",
+            "frontend_archive": "/tmp/frontend.zip",
+        }
+    )
+    manager._write_item(
+        "application",
+        state="ready",
+        version="v3.1.0",
+        can_update=False,
+        can_install=True,
+    )
+
+    status = manager.get_status()
+
+    application = next(item for item in status.updates if item.type == "application")
+    assert application.state == "idle"
+    assert application.version is None
+    assert application.can_install is False
+    assert not (manager._root / "prepared.json").exists()
 
 
 def test_ready_resource_update_clears_after_loaded_version_reaches_target(
@@ -418,10 +563,21 @@ def test_cancel_install_returns_prepared_update_to_ready(monkeypatch, tmp_path):
     assert not manager._install_file.exists()
 
 
+@pytest.mark.parametrize(
+    ("exdev_target", "failure"),
+    [
+        (None, None),
+        ("app", None),
+        ("public", None),
+        ("app", "backup"),
+        ("public", "backup"),
+        (None, "stage"),
+    ],
+)
 def test_apply_prepared_application_replaces_docker_payload_and_preserves_plugins(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, exdev_target, failure
 ):
-    """Docker root worker 应替换前后端目录，同时保留运行时插件和站点资源。"""
+    """Docker 更新应兼容 OverlayFS，并在备份或切换失败时保留旧载荷。"""
     manager = _docker_manager(monkeypatch, tmp_path)
     app_dir = manager._docker_app_dir
     public_dir = manager._docker_public_dir
@@ -433,6 +589,7 @@ def test_apply_prepared_application_replaces_docker_payload_and_preserves_plugin
     (plugin_dir / "__init__.py").write_text("# compatibility\n", encoding="utf-8")
     (plugin_dir / "local_plugin.py").write_text("local\n", encoding="utf-8")
     (resource_dir / "user.sites.v3.bin").write_text("old-resource\n", encoding="utf-8")
+    (resource_dir / "legacy.py").write_text("old-source\n", encoding="utf-8")
     (app_dir / "old.py").write_text("old\n", encoding="utf-8")
     (app_dir / "pyproject.toml").write_text("old-project\n", encoding="utf-8")
     (app_dir / "uv.lock").write_text("old-lock\n", encoding="utf-8")
@@ -447,6 +604,18 @@ def test_apply_prepared_application_replaces_docker_payload_and_preserves_plugin
         archive.writestr("MoviePilot-v3.1.0/pyproject.toml", "[project]\n")
         archive.writestr("MoviePilot-v3.1.0/uv.lock", "version = 1\n")
         archive.writestr("MoviePilot-v3.1.0/new.py", "new\n")
+        archive.writestr(
+            "MoviePilot-v3.1.0/app/plugins/__init__.py",
+            "new compatibility\n",
+        )
+        archive.writestr(
+            "MoviePilot-v3.1.0/app/application/site/__init__.py",
+            "",
+        )
+        archive.writestr(
+            "MoviePilot-v3.1.0/app/application/site/auth.py",
+            "new-auth\n",
+        )
     with zipfile.ZipFile(manager._frontend_archive, "w") as archive:
         archive.writestr("dist/index.html", "new-front\n")
         archive.writestr("dist/version.txt", "v3.1.0\n")
@@ -471,7 +640,39 @@ def test_apply_prepared_application_replaces_docker_payload_and_preserves_plugin
         lambda project_dir, **kwargs: sync_calls.append((project_dir, kwargs)),
     )
 
+    original_replace = Path.replace
+    original_copytree = update_module.shutil.copytree
+
+    def replace(source, target):
+        """模拟 OverlayFS 目录重命名限制及新载荷切换失败。"""
+        if exdev_target == "app" and source == app_dir:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        if exdev_target == "public" and source == public_dir:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        if failure == "stage" and source.name == "App" and target == app_dir:
+            raise OSError(errno.EIO, "stage install failed")
+        return original_replace(source, target)
+
+    def copytree(source, target, *args, **kwargs):
+        """模拟 OverlayFS 备份复制失败，确保旧目录未被删除。"""
+        if failure == "backup" and Path(target).name.endswith(".__update_previous__"):
+            raise OSError(errno.ENOSPC, "backup failed")
+        return original_copytree(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(update_module.shutil, "copytree", copytree)
+
     success, message = manager.apply_prepared_update()
+
+    if failure:
+        assert success is False
+        assert (app_dir / "old.py").read_text(encoding="utf-8") == "old\n"
+        assert (public_dir / "index.html").read_text(encoding="utf-8") == "old-front\n"
+        assert not (app_dir / "new.py").exists()
+        assert (manager._root / "prepared.json").exists()
+        assert not manager._docker_previous_app_dir.exists()
+        assert not manager._docker_previous_public_dir.exists()
+        return
 
     assert success is True
     assert message == "已下载的更新已替换到 Docker 程序目录"
@@ -480,8 +681,13 @@ def test_apply_prepared_application_replaces_docker_payload_and_preserves_plugin
     assert sync_calls[0][1] == {}
     assert (app_dir / "new.py").read_text(encoding="utf-8") == "new\n"
     assert not (app_dir / "old.py").exists()
+    assert (app_dir / "app" / "plugins" / "__init__.py").read_text(
+        encoding="utf-8"
+    ) == "new compatibility\n"
     assert (app_dir / "app" / "plugins" / "local_plugin.py").exists()
     assert (resource_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "old-resource\n"
+    assert (resource_dir / "auth.py").read_text(encoding="utf-8") == "new-auth\n"
+    assert not (resource_dir / "legacy.py").exists()
     assert (public_dir / "index.html").read_text(encoding="utf-8") == "new-front\n"
     assert not manager._install_file.exists()
     assert not (manager._root / "prepared.json").exists()
@@ -565,3 +771,25 @@ def test_apply_prepared_resources_replaces_complete_docker_resource_package(
     assert not (resource_dir / "sites.cpython-old.so").exists()
     assert not manager._install_file.exists()
     assert not (manager._root / "prepared.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("current", "expected_state"),
+    [("v3.0.10", "available"), ("v3.0.10-1", "idle")],
+)
+def test_check_accepts_hotfix_release_suffix(monkeypatch, tmp_path, current, expected_state):
+    """-N 后缀的临时修复版本视为稳定版，并按数字大于同号正式版。"""
+    manager = _manager(monkeypatch, tmp_path)
+    releases = [
+        {"tag_name": "v3.0.11-beta", "prerelease": True, "draft": False},
+        {"tag_name": "v3.0.10-1", "name": "v3.0.10-1", "prerelease": False, "draft": False},
+        {"tag_name": "v3.0.10", "name": "v3.0.10", "prerelease": False, "draft": False},
+    ]
+    monkeypatch.setattr(manager, "_request", lambda: SimpleNamespace(get_res=lambda _url: _response(releases)))
+    monkeypatch.setattr(update_module, "get_app_version", lambda: current)
+
+    status = manager.check("application")
+
+    assert status.state == expected_state
+    if expected_state == "available":
+        assert status.version == "v3.0.10-1"

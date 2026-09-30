@@ -19,7 +19,10 @@ SAFE_READ_TOOL_NAMES: frozenset[str] = frozenset()
 
 def requests_system_setting_secrets(arguments: Mapping[str, Any]) -> bool:
     """判断结构化 API 参数是否请求读取未脱敏系统设置。"""
-    if str(arguments.get("operation_id") or "") != "config.system.get":
+    if str(arguments.get("operation_id") or "") not in {
+        "config.system.get",
+        "config.system.describe",
+    }:
         return False
     for location in ("body", "query"):
         values = arguments.get(location)
@@ -115,7 +118,7 @@ class ToolPolicyRegistry:
                 )
             return ActionPolicy(
                 effect=(ActionEffect.REVERSIBLE_WRITE if action in {"switch", "update"} else ActionEffect.UNKNOWN),
-                required_role=(PrincipalRole.SYSTEM_ADMIN if action == "update" else PrincipalRole.USER),
+                required_role=PrincipalRole.SYSTEM_ADMIN,
                 confirmation=ConfirmationMode.REQUIRED,
                 recovery=RecoveryMode.BEFORE_STATE,
                 result_sensitivity=ResultSensitivity.NORMAL,

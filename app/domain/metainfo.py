@@ -290,7 +290,9 @@ def _prepare_meta_input(
     应用识别词、显式标签和文件后缀规则，生成稳定的解析阶段输入。
     """
     original_title = title
-    parsed_title, apply_words = WordsMatcher().prepare(title, custom_words=custom_words)
+    parsed_title, parsed_subtitle, apply_words = WordsMatcher().prepare_with_subtitle(
+        title, subtitle, custom_words=custom_words
+    )
     # 完整 Rust 入口已经失败或被禁用，参考实现不得再次跨边界调用部分 Rust 解析器。
     parsed_title, explicit_metainfo = _find_metainfo_python(parsed_title)
     media_exts = get_media_extensions()
@@ -303,7 +305,7 @@ def _prepare_meta_input(
     return _PreparedMetaInput(
         original_title=original_title,
         parsed_title=parsed_title,
-        subtitle=subtitle,
+        subtitle=parsed_subtitle,
         isfile=isfile,
         apply_words=tuple(apply_words or ()),
         explicit_metainfo=explicit_metainfo,
@@ -409,10 +411,12 @@ def _rust_custom_parse_options(custom_words: Tuple[str, ...]) -> dict:
 def _rust_parse_options(custom_words: List[str] = None) -> dict:
     """
     收集 Rust Meta 解析所需的运行时配置，避免 Rust 层直接访问数据库和 settings。
+
+    与 Python 识别词匹配器保持一致：None 或空列表沿用全局规则，非空列表覆盖全局规则。
     """
-    if custom_words is None:
+    if not custom_words:
         return _rust_default_parse_options()
-    return _rust_custom_parse_options(tuple(custom_words or []))
+    return _rust_custom_parse_options(tuple(custom_words))
 
 
 def clear_rust_parse_options_cache() -> None:

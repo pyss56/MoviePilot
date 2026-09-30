@@ -87,6 +87,7 @@ if TYPE_CHECKING:
             *,
             effective_override: ClassificationSelection | None = None,
             refresh: bool = False,
+            allow_enrichment: bool = True,
         ) -> Optional[_ClassificationSubjectT]:
             """通过注入的应用服务分类一个完整识别结果。"""
             ...
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
             *,
             effective_override: ClassificationSelection | None = None,
             refresh: bool = False,
+            allow_enrichment: bool = True,
         ) -> Optional[_ClassificationSubjectT]:
             """通过注入的应用服务异步补充并分类完整识别结果。"""
             ...
@@ -169,6 +171,8 @@ if TYPE_CHECKING:
             path: Union[str, Path],
             music_release_regions: Optional[list[str]] = None,
             music_release_scripts: Optional[list[str]] = None,
+            contextual_meta: Optional[MetaMusic] = None,
+            file_paths: Optional[list[Path]] = None,
         ) -> dict[str, MusicInfo]:
             """同步识别音乐专辑目录。"""
             ...
@@ -188,6 +192,8 @@ if TYPE_CHECKING:
             path: Union[str, Path],
             music_release_regions: Optional[list[str]] = None,
             music_release_scripts: Optional[list[str]] = None,
+            contextual_meta: Optional[MetaMusic] = None,
+            file_paths: Optional[list[Path]] = None,
         ) -> dict[str, MusicInfo]:
             """异步识别音乐专辑目录。"""
             ...

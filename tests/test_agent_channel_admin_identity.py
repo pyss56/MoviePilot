@@ -4,7 +4,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from app.application.messaging.agent import matches_channel_admin, resolve_config_principal_ids
+from app.application.messaging.channel.admin import (
+    matches_channel_admin,
+    resolve_config_principal_ids,
+)
 from app.modules.discord import DiscordModule
 from app.modules.feishu.feishu import Feishu
 from app.modules.qqbot.module import QQBotModule
@@ -615,7 +618,7 @@ def test_qq_group_uses_only_member_openid_for_admin(admins, expected):
 def test_vocechat_group_uses_only_sender_uid_for_admin(admins, expected):
     message = _parse_module_message(
         VoceChatModule(),
-        config={"VOCECHAT_ADMINS": admins, "channel_id": "2"},
+        config={"VOCECHAT_ADMINS": admins, "VOCECHAT_CHANNEL_ID": "2"},
         body=json.dumps(
             {
                 "detail": {

@@ -259,8 +259,11 @@ moviepilot setup --config-dir /path/to/moviepilot-config
   可按需启用，并配置 `LLM_PROVIDER`、`LLM_MODEL`、`LLM_API_KEY`、`LLM_BASE_URL`
   与 `LLM_WEB_SEARCH_MODE`。联网搜索支持 MoviePilot 本地搜索、模型服务端搜索、
   服务端优先自动回退与完全关闭；服务端模式仅在当前模型目录声明支持时生效。
+  向导会尝试读取当前提供商的模型目录；目录服务不可用时仍可手动输入模型 ID。
   当前可识别 OpenAI、Anthropic Claude、Google Gemini、xAI Grok 与 DeepSeek
   官方端点已公布的服务端联网搜索能力，第三方兼容端点不会被自动误判。
+- 下载目录按下载器内部路径原样保存，可用于远程下载器和路径映射；向导不会在本机解析或创建它。
+  媒体库目录是 MoviePilot 本地路径，向导会确保其存在。
 - 用户站点认证
   可按需选择认证站点，并按站点要求填写用户名、UID、Passkey 等参数
 - 开机自启
@@ -529,6 +532,8 @@ docker compose start <service>
 说明：
 
 - SQLite 使用在线备份 API，PostgreSQL 使用镜像内置的 `pg_dump` custom format
+- SQLite 插件自有数据库会在创建宿主备份时同步备份到 `database_backup/plugins/<插件ID>/`，文件名格式为 `<插件ID>_<插件版本>_sqlite_<时间>.db`
+- PostgreSQL 插件自有数据库使用独立 schema；插件建库会校验当前账号的 schema 使用和建表权限，权限不足时插件不会进入运行态
 - 源码部署使用 PostgreSQL 时，宿主机需安装 `pg_dump` 和 `pg_restore` 并加入 `PATH`；Docker 镜像已内置
 - 默认目录为配置目录下的 `database_backup/`，可通过 `DB_BACKUP_PATH` 调整
 - 备份、列举和校验可独立通过 CLI 执行

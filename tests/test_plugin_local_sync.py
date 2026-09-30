@@ -163,6 +163,7 @@ def _set_installed_plugins(monkeypatch, plugin_ids: list[str]) -> None:
         read=lambda key: plugin_ids
         if key == SystemConfigKey.UserInstalledPlugins
         else None,
+        write=lambda _key, _value: None,
     )
     monkeypatch.setattr(
         "app.runtime.extensions.plugin.storage._plugin_storage",
@@ -254,6 +255,41 @@ def test_local_plugin_candidate_keeps_system_version_gate_outside_dev(
     assert candidate["system_version_compatible"] is False
     assert candidate["compatible"] is False
     assert "MoviePilot 版本 >=2.13.11" in candidate["skip_reason"]
+
+
+def test_local_plugin_candidate_marks_runtime_incompatible_as_unusable(
+    tmp_path,
+    monkeypatch,
+    plugin_manager: PluginManager,
+) -> None:
+    """free-threaded 运行时下声明不支持的本地候选必须投影为不可安装。
+
+    本地热同步只认 compatible 位；漏掉运行时这一位，每次源码变更都会发起一次
+    必然被安装准入拒绝的安装，只留下一条无意义的失败日志。
+    """
+    repo_path, source_file = _build_local_plugin_repo(tmp_path)
+    (repo_path / "package.v2.json").write_text(
+        '{"DemoPlugin": {"version": "1.0.0", "v3t": false}}',
+        encoding="utf-8",
+    )
+
+    _patch_plugin_runtime_settings(
+        monkeypatch,
+        SimpleNamespace(
+            DEV=False,
+            ROOT_PATH=tmp_path,
+            PLUGIN_LOCAL_REPO_PATHS=str(repo_path),
+        ),
+    )
+    from app.adapters.external.plugin import client as plugin_client_module
+
+    monkeypatch.setattr(plugin_client_module, "is_free_threaded_runtime", lambda: True)
+
+    candidate = plugin_manager._get_local_plugin_candidate_from_path(source_file)
+
+    assert candidate["runtime_compatible"] is False
+    assert candidate["compatible"] is False
+    assert "v3t" in candidate["skip_reason"]
 
 
 def test_local_plugin_sync_without_candidate_respects_system_version_gate(
@@ -867,7 +903,12 @@ def test_plugin_reload_refreshes_scheduler_services_idempotently(monkeypatch):
 
     assert set(scheduler._jobs) == {"DemoPlugin_new"}
     service = scheduler._jobs["DemoPlugin_new"]
-    assert service["func"] is current_func
+    # 定时服务回调经 wrap_for_plugin_instance 包了一层日志实例上下文绑定，
+    # 不再是原始 callable 本身；用 __wrapped__ 核对包装前后是同一个函数，
+    # 并实测调用确实透传到原始 Mock。
+    assert service["func"].__wrapped__ is current_func
+    service["func"](marker="check")
+    current_func.assert_called_once_with(marker="check")
     assert service["kwargs"] == {"marker": "new"}
     assert set(backend.jobs) == {"DemoPlugin_new"}
     registered_job = backend.jobs["DemoPlugin_new"]

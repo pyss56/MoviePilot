@@ -17,9 +17,6 @@
   "app/agent/llm/tools.py": {
     "I001": 1
   },
-  "app/agent/middleware/memory.py": {
-    "I001": 1
-  },
   "app/agent/middleware/selection.py": {
     "I001": 1
   },
@@ -296,9 +293,6 @@
   "app/modules/listenbrainz/__init__.py": {
     "I001": 1
   },
-  "app/modules/lrclib/__init__.py": {
-    "I001": 1
-  },
   "app/modules/navidrome/__init__.py": {
     "F401": 2,
     "I001": 1
@@ -462,9 +456,6 @@
   "app/runtime/extensions/plugin/loader.py": {
     "I001": 1
   },
-  "app/runtime/extensions/plugin/storage.py": {
-    "I001": 1
-  },
   "app/runtime/gc.py": {
     "I001": 1
   },
@@ -502,9 +493,6 @@
     "I001": 1
   },
   "app/sdk/network.py": {
-    "I001": 1
-  },
-  "app/sdk/plugins.py": {
     "I001": 1
   },
   "app/sdk/services.py": {
@@ -746,9 +734,6 @@
     "I001": 1
   },
   "tests/test_metainfo.py": {
-    "I001": 1
-  },
-  "tests/test_metamusic.py": {
     "I001": 1
   },
   "tests/test_module_quality.py": {

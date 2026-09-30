@@ -674,6 +674,7 @@ class TransferExecutionRepository(Protocol):
     ) -> TransferExecutionSnapshot:
         """确认所有引用步骤成功后提交聚合执行检查点。"""
 
+
 class TransferStepRunner(Protocol):
     """定义文件执行方可注入的单步骤持久执行边界。"""
 
@@ -866,9 +867,9 @@ class TransferExecutionCommand:
             reason: str,
             result: Optional[TransferStepResult] = None,
     ) -> TransferManualReviewResult:
-        """提交人工判定；FAILED 在无 lease durable 结算落地前明确拒绝。"""
-        if not all((task_id, operation_id, actor, reason)):
-            raise ValueError("人工判定缺少任务、步骤、操作者或原因")
+        """提交人工判定，理由可留空；FAILED 仍须经 lease durable 结算。"""
+        if not all((task_id, operation_id, actor)):
+            raise ValueError("人工判定缺少任务、步骤或操作者")
         if decision is TransferManualReviewDecision.APPLIED and result is None:
             raise ValueError("人工判定已发生时必须提供结果证据")
         if decision is TransferManualReviewDecision.FAILED:
@@ -961,6 +962,7 @@ class TransferManualReviewQuery:
         if result is not None:
             self._validate_state(result.state)
         return result
+
 
 __all__ = [
     "TRANSFER_EXECUTION_VERSION",

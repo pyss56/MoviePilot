@@ -59,6 +59,15 @@ class PluginSystemServices:
         """补充插件条目的主程序版本兼容信息。"""
         return self.market.annotate_system_version(plugin_info)
 
+    def annotate_runtime_compatibility(
+        self, plugin_info: dict[str, Any]
+    ) -> dict[str, Any]:
+        """补充插件条目的运行时（free-threaded）兼容信息。"""
+        return cast(
+            dict[str, Any],
+            self.market.annotate_runtime_compatibility(plugin_info),
+        )
+
     def is_package_compatible(self, plugin_info: dict, package_version: str) -> bool:
         """判断插件条目是否兼容指定代际。"""
         return self.market.is_package_compatible(plugin_info, package_version)
@@ -94,34 +103,6 @@ class PluginSystemServices:
     def remove_plugin_package(self, plugin_id: str) -> bool:
         """通过唯一包事务 owner 删除插件物理目录。"""
         return bool(self.package.remove_plugin(plugin_id))
-
-    def modify_plugin_files(self, **kwargs: Any) -> tuple[bool, str]:
-        """把旧分身源码改写调用收口到唯一包适配器。"""
-        return cast(tuple[bool, str], self.package._modify_plugin_files(**kwargs))
-
-    def modify_python_file(self, **kwargs: Any) -> tuple[bool, str]:
-        """把旧 Python 类改写调用收口到唯一包适配器。"""
-        return cast(tuple[bool, str], self.package._modify_python_file(**kwargs))
-
-    def modify_federation_files(self, **kwargs: Any) -> tuple[bool, str]:
-        """把旧联邦构建产物改写调用收口到唯一包适配器。"""
-        return cast(
-            tuple[bool, str],
-            self.package._modify_federation_files(**kwargs),
-        )
-
-    def rename_federation_assets(
-        self,
-        dist_dir: Path,
-        original_class_name: str,
-        clone_class_name: str,
-    ) -> None:
-        """把旧联邦资源重命名调用收口到唯一包适配器。"""
-        self.package._rename_federation_assets(
-            dist_dir,
-            original_class_name,
-            clone_class_name,
-        )
 
 
 _services: Optional[PluginSystemServices] = None

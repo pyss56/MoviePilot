@@ -13,7 +13,14 @@ from app.domain.context import Context, MusicAlbumInfo, MusicInfo
 from app.domain.meta.metamusic import MetaMusic
 from app.domain.meta.runtime import get_metainfo_accelerator
 from app.domain.metainfo import MetaInfo, MetaInfoPath
-from app.domain.music import match_music_resource, music_isrc_matches, music_version_matches
+from app.domain.music import (
+    match_music_resource,
+    music_album_matches,
+    music_isrc_matches,
+    music_title_matches,
+    music_version_matches,
+    music_year_matches,
+)
 from app.schemas.music import MusicMeta
 from app.schemas.types import MediaType
 
@@ -103,6 +110,26 @@ def test_resource_parser_merges_subtitle_without_target_information():
     assert meta.media_id is None
 
 
+def test_resource_parser_reads_unlabelled_album_description():
+    """描述末尾的无冒号专辑字段也应保留作品证据。"""
+    description = "Apple Music ALAC 宋冬野 2026 06 29 专辑 再想想"
+    meta = MetaMusic.parse_resource(
+        "Song DongYe 2026 AppleLossless Take Another Moment", description
+    )
+    assert (meta.title, meta.album, meta.artists, meta.year) == (
+        "AppleLossless Take Another Moment", "再想想", ["Song DongYe"], 2026
+    )
+
+
+def test_album_match_uses_unlabelled_description_title_as_candidate():
+    """外文资源的中文专辑描述可形成候选，但未核验艺术家不能自动命中。"""
+    title = "Song DongYe 2026 AppleLossless Take Another Moment"
+    description = "Apple Music ALAC 宋冬野 2026 06 29 专辑 再想想"
+    target = MusicInfo(music_type="album", title="再想想", artists=["宋冬野"], year=2026)
+    result = match_music_resource(target, title, description)
+    assert (result.status, result.reason) == ("candidate", "artist_unverified")
+
+
 def test_resource_parser_preserves_title_evidence_and_parses_track_segments():
     """冲突副标题不能覆盖标题艺术家，明确的曲序段则可用于区分专辑和单曲。"""
     meta = MetaMusic.parse_resource("Artist - Album - 01 - Song [FLAC]", "演唱：Other Artist")
@@ -116,6 +143,50 @@ def test_resource_parser_keeps_bracketed_title():
     meta = MetaMusic.parse_resource("【永遠・是朋友】24bit／96kHz", "專輯藝人：周華健；無損音樂")
     assert meta.title and "永遠" in meta.title
     assert meta.artists == ["周華健"]
+
+
+@pytest.mark.parametrize("title", [
+    'Macavity (From The Motion Picture Soundtrack "Cats")',
+    'Beautiful Ghosts (From The Motion Picture "Cats")',
+    "Beautiful Ghosts《猫》原声插曲",
+])
+def test_soundtrack_credit_does_not_change_recording_title(title):
+    """影视来源说明不是歌名本体，不能让正确的 MusicBrainz 录音候选被拒绝。"""
+    expected = "Macavity" if title.startswith("Macavity") else "Beautiful Ghosts"
+    assert music_title_matches(MusicInfo(title=expected), title)
+
+
+@pytest.mark.parametrize("symbol", ["÷", "+", "=", "×", "−"])
+def test_symbol_only_music_title_matches_itself_and_alias(symbol):
+    """纯符号作品名不能因文本归一化为空而失去自身和别名匹配。"""
+    music = MusicInfo(title=symbol, title_aliases=["Readable Alias"])
+
+    assert music_title_matches(music, symbol)
+    assert music_title_matches(music, "Readable Alias")
+    assert not music_title_matches(music, "Different Title")
+
+
+@pytest.mark.parametrize("symbol,alias,year", [
+    ("÷", "Divide", 2017),
+    ("+", "Plus", 2011),
+    ("=", "Equals", 2021),
+    ("×", "Multiply", 2017),
+    ("−", "Subtract", 2023),
+])
+def test_symbol_only_album_matches_parsed_resource(symbol, alias, year):
+    """纯符号专辑经资源解析后仍应按原名或可信别名精确命中。"""
+    music = MusicInfo(
+        music_type="album",
+        title=symbol,
+        album=symbol,
+        title_aliases=[alias],
+        album_aliases=[alias],
+        artists=["Ed Sheeran"],
+        year=year,
+    )
+
+    resource = f"Ed Sheeran - {symbol} - {year} - FLAC 分轨"
+    assert match_music_resource(music, resource).status == "exact"
 
 
 def test_music_album_field_cannot_match_target_recording():
@@ -183,6 +254,41 @@ def test_music_version_checks_only_explicit_conflicting_dates(expected, actual, 
     target = MusicInfo(title="1999", artists=["Artist"], version=expected)
     meta = MetaMusic(title="1999", artists=["Artist"], version=actual)
     assert music_version_matches(target, meta) is matched
+
+
+def test_taylors_version_is_distinct_from_original_recording():
+    """Taylor's Version 是重新录制，不得与原版仅凭同名和同艺人互换。"""
+    rerecorded = MusicInfo(
+        title="Back to December (Taylor's Version)",
+        artists=["Taylor Swift"],
+    )
+    original = MetaMusic(title="Back To December", artists=["Taylor Swift"])
+    same_version = MetaMusic(
+        title="Back To December (Taylor’s Version)",
+        artists=["Taylor Swift"],
+    )
+
+    assert music_version_matches(rerecorded, original) is False
+    assert music_version_matches(rerecorded, same_version) is True
+
+
+def test_music_release_evidence_rejects_wrong_album_and_year():
+    """同名同艺人的录音仍须服从文件标签中的专辑本体和发行年份。"""
+    info = MusicInfo(
+        title="Sparks Fly",
+        artists=["Taylor Swift"],
+        album="Speak Now",
+        year=2025,
+    )
+    meta = MetaMusic(
+        title="Sparks Fly",
+        artists=["Taylor Swift"],
+        album="Speak Now (Target Exclusive Deluxe Edition 2CD).CD1",
+        year=2010,
+    )
+
+    assert music_album_matches(info, meta.album) is True
+    assert music_year_matches(info, meta) is False
 
 
 def test_music_resource_rejects_different_dated_live_recording():
@@ -331,6 +437,72 @@ def test_music_simplification_preserves_original_search_names():
     assert keywords[:2] == ["永远是朋友", "永遠是朋友"]
     assert "周華健" in simplified.artist_aliases
     assert MusicInfo.from_dict(simplified.to_dict()).title_aliases == ["永遠是朋友"]
+
+
+def test_music_simplification_prefers_chinese_artist_alias(monkeypatch):
+    """开启音乐简体转换时，整理名称应优先使用同一艺人的中文别名。"""
+    original = MusicInfo(
+        title="舞孃",
+        artists=["Jolin Tsai"],
+        artist_aliases=["Jolin Tsai", "蔡依林"],
+    )
+    monkeypatch.setattr("app.runtime.config.settings.MUSIC_METADATA_TO_SIMPLIFIED", True)
+
+    simplified = MediaChain._simplify_recognized_music_info(original)
+
+    assert simplified.artists == ["蔡依林"]
+    assert "Jolin Tsai" in simplified.artist_aliases
+    assert original.artists == ["Jolin Tsai"]
+
+
+def test_music_simplification_keeps_artist_name_when_disabled(monkeypatch):
+    """关闭音乐简体转换时，不得因中文别名改变整理使用的艺术家名称。"""
+    original = MusicInfo(
+        title="舞孃",
+        artists=["Jolin Tsai"],
+        artist_aliases=["Jolin Tsai", "蔡依林"],
+    )
+    monkeypatch.setattr("app.runtime.config.settings.MUSIC_METADATA_TO_SIMPLIFIED", False)
+
+    result = MediaChain._simplify_recognized_music_info(original)
+
+    assert result is original
+    assert result.artists == ["Jolin Tsai"]
+
+
+def test_music_simplification_keeps_multi_artist_aliases_isolated(monkeypatch):
+    """多位艺术家同时整理时，中文别名必须按艺术家身份分别匹配。"""
+    original = MusicInfo(
+        title="合作曲",
+        artists=["Jolin Tsai", "Jay Chou"],
+        artist_ids=["artist-1", "artist-2"],
+        artist_aliases=["Jolin Tsai", "蔡依林", "Jay Chou", "周杰伦"],
+        raw_data={
+            "artist-credit": [
+                {
+                    "name": "Jolin Tsai",
+                    "artist": {
+                        "id": "artist-1",
+                        "name": "Jolin Tsai",
+                        "aliases": [{"name": "蔡依林"}],
+                    },
+                },
+                {
+                    "name": "Jay Chou",
+                    "artist": {
+                        "id": "artist-2",
+                        "name": "Jay Chou",
+                        "aliases": [{"name": "周杰伦"}],
+                    },
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr("app.runtime.config.settings.MUSIC_METADATA_TO_SIMPLIFIED", True)
+
+    simplified = MediaChain._simplify_recognized_music_info(original)
+
+    assert simplified.artists == ["蔡依林", "周杰伦"]
 
 
 def test_music_album_alias_is_used_for_search():

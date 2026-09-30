@@ -3,8 +3,6 @@ import inspect
 import sys
 from typing import Callable, cast
 
-from app.adapters.cache.redis import AsyncRedisHelper, RedisHelper
-
 # SitesHelper涉及资源包拉取，提前引入并容错提示
 try:
     from app.application.site.sites import SitesHelper  # noqa  # pylint: disable=import-error,no-name-in-module
@@ -23,7 +21,6 @@ from app.application.configuration import (
     reset_transfer_retry_config,
 )
 from app.application.messaging.agent import (
-    dispatch_web_agent_message_event,
     shutdown_web_agent_background_tasks,
     wait_web_agent_background_tasks,
 )
@@ -34,11 +31,13 @@ from app.application.messaging.message import (
     MessageHelper,
     stop_message,
 )
+from app.application.messaging.webagent.events import dispatch_web_agent_message_event
 from app.application.module import configure_module_runtime, reset_module_runtime
 from app.application.outbox import configure_outbox_dispatcher
 from app.application.plugin.runtime import get_existing_plugin_manager
 from app.application.security.url import close_image_proxy_block_log_coalescer
 from app.application.service import configure_service_directory, reset_service_directory
+from app.application.site.auth import normalize_site_auth_config
 from app.command import CommandChain
 from app.db.session import (
     close_database,
@@ -66,6 +65,7 @@ from app.startup.composition.agent import (
     publish_agent_services,
     reset_agent_services,
 )
+from app.startup.composition.cache import get_cache_composition
 from app.startup.composition.chain import (
     configure_chain_runtime_context,
     configure_directory_classification_service,
@@ -258,8 +258,10 @@ def _existing_singleton(instance_type: type) -> object | None:
     return getter() if callable(getter) else None
 
 
-def _call_existing_singleton(instance_type: type, method_name: str) -> object:
-    """调用已存在 Singleton 的关闭方法；owner 未创建时视为已经收敛。"""
+def _call_existing_singleton(instance_type: type | None, method_name: str) -> object:
+    """调用已存在 Singleton 的关闭方法；owner 未接入或未创建时视为已经收敛。"""
+    if instance_type is None:
+        return True
     instance = _existing_singleton(instance_type)
     if instance is None:
         return True
@@ -309,8 +311,11 @@ def get_config_reload_handler_providers(
     system_helper = SystemHelper()
     providers: dict[type, Callable[[], object | None]] = {
         SystemHelper: lambda: system_helper,
-        RedisHelper: RedisHelper.get_existing_instance,
-        AsyncRedisHelper: AsyncRedisHelper.get_existing_instance,
+        # Redis 连接 owner 只在启动时选用 Redis 缓存后存在。
+        **{
+            owner: owner.get_existing_instance
+            for owner in get_cache_composition().redis_owners
+        },
         TransferChain: TransferChain.get_existing_instance,
         Monitor: Monitor.get_existing_instance,
     }
@@ -358,7 +363,7 @@ def configure_config_reload_event_handler_resolver() -> None:
             owner_name=owner_class.__name__,
         )
 
-    EventManager().register_handler_instance_resolver(  # type: ignore[no-untyped-call]
+    EventManager().register_handler_instance_resolver(
         "config_reload",
         resolve,
     )
@@ -460,7 +465,18 @@ def user_auth():
     if sites_helper.auth_level >= 2:
         return
     auth_conf = get_configured_system_config().get(SystemConfigKey.UserSiteAuthParams)
-    status, msg = sites_helper.check_user(**auth_conf) if auth_conf else sites_helper.check_user()
+    if get_runtime_setting("AUTH_SITE"):
+        status, msg = sites_helper.check_user()
+    else:
+        normalized_auth_conf = normalize_site_auth_config(
+            auth_conf,
+            sites_helper.get_authsites(),
+        )
+        status, msg = (
+            sites_helper.check_user(**normalized_auth_conf)
+            if normalized_auth_conf
+            else sites_helper.check_user()
+        )
     if status:
         logger.info(f"{msg} 用户认证成功")
     else:
@@ -569,15 +585,6 @@ async def stop_modules() -> bool:
         lambda: _call_existing_singleton(ThreadHelper, "shutdown"),
         offload=True,
     )
-    await run_step(
-        "Redis缓存连接",
-        lambda: _call_existing_singleton(RedisHelper, "close"),
-        offload=True,
-    )
-    await run_step(
-        "异步Redis缓存连接",
-        lambda: _call_existing_singleton(AsyncRedisHelper, "close"),
-    )
     # Web Agent 的取消 finally 可能还要写入最终展示快照，必须先完成任务收尾，再关闭写入准入。
     web_agent_drained = await run_step(
         "Web Agent后台任务",
@@ -619,6 +626,17 @@ async def stop_modules() -> bool:
             logger.error(
                 "数据库任务未收敛，保留全部 Provider 和数据库连接以供诊断与重试"
             )
+    # Redis 连接池由全部缓存共享，前面的 Agent 收尾、数据库任务和 Provider 撤销都可能读写缓存；
+    # 放在最后关闭，避免关闭后又被自动重连且再无步骤收口。
+    await run_step(
+        "Redis缓存连接",
+        lambda: _call_existing_singleton(get_cache_composition().sync_redis_owner, "close"),
+        offload=True,
+    )
+    await run_step(
+        "异步Redis缓存连接",
+        lambda: _call_existing_singleton(get_cache_composition().async_redis_owner, "close"),
+    )
     return all_converged
 
 

@@ -231,10 +231,27 @@ def test_download_single_submits_download_added_to_background(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("content_path", "expected_target_dir"),
+    [
+        pytest.param(
+            "/downloading/Demo.Movie",
+            Path("/downloading/Demo.Movie"),
+            id="multi-file-torrent-root",
+        ),
+        pytest.param(
+            "/downloading/Demo.Movie/Demo.Movie.mkv",
+            Path("/downloading/Demo.Movie"),
+            id="single-file-inside-same-name-folder",
+        ),
+    ],
+)
 def test_download_site_subtitles_uses_downloader_content_path_without_creating_save_folder(
         monkeypatch,
+        content_path,
+        expected_target_dir,
 ):
-    """TempPath 任务应使用下载器当前内容目录，不能在 save_path 预建同名目录。"""
+    """TempPath 字幕应定位到种子根目录，避免同名目录内单文件重复拼接。"""
     accessed_paths = []
 
     class _FakeTorrentHelper:
@@ -250,7 +267,7 @@ def test_download_site_subtitles_uses_downloader_content_path_without_creating_s
         def get_file_item(self, storage, path):
             """记录查询并返回 TempPath 内容目录。"""
             accessed_paths.append((storage, path))
-            if path == Path("/downloading/Demo.Movie"):
+            if path == expected_target_dir:
                 return FileItem(
                     storage=storage,
                     type="dir",
@@ -277,12 +294,13 @@ def test_download_site_subtitles_uses_downloader_content_path_without_creating_s
     chain.list_torrents = MagicMock(return_value=[DownloaderTorrent(
         hash="hash123",
         downloader="qb",
-        content_path="/downloading/Demo.Movie",
+        content_path=content_path,
     )])
     chain._site_subtitle_links = MagicMock(return_value=[])
     context = Context(
         torrent_info=TorrentInfo(page_url="https://example.com/torrent/1"),
     )
+    monkeypatch.setattr(download_subtitle.time, "sleep", lambda _seconds: None)
 
     chain.download_site_subtitles(
         context=context,
@@ -292,7 +310,7 @@ def test_download_site_subtitles_uses_downloader_content_path_without_creating_s
         downloader="qb",
     )
 
-    assert accessed_paths == [("local", Path("/downloading/Demo.Movie"))]
+    assert accessed_paths == [("local", expected_target_dir)]
     chain.list_torrents.assert_called_once_with(
         hashs=["hash123"],
         downloader="qb",
@@ -332,6 +350,9 @@ def test_download_site_subtitles_does_not_create_missing_save_folder(monkeypatch
         user_agent="MoviePilotTest",
     )
     chain.list_torrents = MagicMock(return_value=[])
+    chain.transfer_history_repository = SimpleNamespace(
+        list_by_hash=MagicMock(return_value=[]),
+    )
     chain._site_subtitle_links = MagicMock()
     context = Context(
         torrent_info=TorrentInfo(page_url="https://example.com/torrent/1"),
@@ -346,6 +367,151 @@ def test_download_site_subtitles_does_not_create_missing_save_folder(monkeypatch
     )
 
     chain._site_subtitle_links.assert_not_called()
+
+
+def test_download_site_subtitles_recreates_source_directory_and_queues_subtitle(monkeypatch):
+    """视频整理后源目录被移动清理时，应恢复目录并把新字幕交给整理队列。"""
+    accessed_paths = []
+    created_dirs = []
+    transfer_calls = []
+    operation_order = []
+    target_dir = Path("/download/影视下载/下载中/Demo.Show")
+    subtitle_item = FileItem(
+        storage="local",
+        type="file",
+        path=(target_dir / "Demo.Show.S01E01.CHS.srt").as_posix(),
+        name="Demo.Show.S01E01.CHS.srt",
+        extension="srt",
+    )
+    transfer_histories = [SimpleNamespace(
+        status=True,
+        src="/download/影视下载/下载中/Demo.Show/Demo.Show.S01E01.1080p.WEB-DL.mkv",
+        dest="/media/电视剧/Example/Season 01/Example - S01E01.mkv",
+    )]
+
+    class _FakeTorrentHelper:
+        """提供固定的多文件种子目录名。"""
+
+        def get_fileinfo_from_torrent_content(self, _content):
+            """返回多文件种子目录名。"""
+            return "Demo.Show", []
+
+    class _FakeStorageChain:
+        """模拟源目录被整理清理并能重新创建。"""
+
+        def get_file_item(self, storage, path):
+            """记录源目录检查并报告其不存在。"""
+            accessed_paths.append((storage, path))
+            return None
+
+        def get_folder(self, storage, path):
+            """仅重建原下载目录。"""
+            created_dirs.append((storage, path))
+            return FileItem(
+                storage=storage,
+                type="dir",
+                path=path.as_posix(),
+                name=path.name,
+            )
+
+        def list_files(self, _folder, recursion=False):
+            """提供字幕文件，并确认保存操作先于队列提交。"""
+            assert recursion is False
+            assert "saved" in operation_order
+            operation_order.append("list")
+            return [subtitle_item]
+
+    class _FakeTransferChain:
+        """记录标准整理队列提交。"""
+
+        def do_transfer(self, **kwargs):
+            """保存自动整理请求参数。"""
+            transfer_calls.append(kwargs)
+            operation_order.append("queued")
+            return True, "已添加到整理队列"
+
+    monkeypatch.setattr(download_subtitle, "TorrentHelper", _FakeTorrentHelper)
+    monkeypatch.setattr(download_subtitle, "StorageChain", _FakeStorageChain)
+    monkeypatch.setattr(download_subtitle.time, "sleep", lambda _seconds: None)
+    from app.chain.transfer import facade as transfer_facade
+    monkeypatch.setattr(transfer_facade, "TransferChain", _FakeTransferChain)
+
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.runtime_config = SimpleNamespace(
+        download_subtitle=True,
+        proxy=None,
+        temporary_path=Path("/tmp/moviepilot-test"),
+        subtitle_extensions=tuple(settings.RMT_SUBEXT),
+        media_extensions=tuple(settings.RMT_MEDIAEXT),
+        user_agent="MoviePilotTest",
+    )
+    chain.list_torrents = MagicMock(return_value=[DownloaderTorrent(
+        hash="hash123",
+        downloader="qb",
+        content_path="/download/影视下载/下载中/Demo.Show",
+    )])
+    chain.transfer_history_repository = SimpleNamespace(
+        list_by_hash=MagicMock(return_value=transfer_histories),
+    )
+    chain._site_subtitle_links = MagicMock(return_value=["https://example.com/subtitle.srt"])
+
+    class _FakeResponse:
+        """为字幕下载回调提供可关闭的成功响应。"""
+
+        status_code = 200
+        content = b"subtitle-content"
+
+        def close(self):
+            """模拟释放网络响应。"""
+
+    class _FakeHttp:
+        """返回固定字幕响应，避免真实网络请求。"""
+
+        def get(self, *_args, **_kwargs):
+            """返回成功响应。"""
+            return _FakeResponse()
+
+    monkeypatch.setattr(
+        download_subtitle,
+        "_download_ports_snapshot",
+        lambda: (_FakeHttp(), object()),
+    )
+
+    def _save_response(**kwargs):
+        """记录字幕已保存到重新创建的原下载目录。"""
+        assert kwargs["working_dir_item"].path == target_dir.as_posix()
+        operation_order.append("saved")
+
+    chain._save_site_subtitle_response = MagicMock(side_effect=_save_response)
+    mediainfo = SimpleNamespace(type=MediaType.TV)
+    context = Context(
+        media_info=mediainfo,
+        torrent_info=TorrentInfo(page_url="https://example.com/torrent/1"),
+    )
+
+    chain.download_site_subtitles(
+        context=context,
+        download_dir=Path("/download/影视下载/下载中"),
+        torrent_content=b"torrent-content",
+        download_hash="hash123",
+        downloader="qb",
+    )
+
+    assert accessed_paths == [("local", target_dir)]
+    assert created_dirs == [("local", target_dir)]
+    chain.transfer_history_repository.list_by_hash.assert_called_once_with("hash123")
+    chain._site_subtitle_links.assert_called_once_with(context)
+    chain._save_site_subtitle_response.assert_called_once()
+    assert operation_order == ["saved", "list", "queued"]
+    assert len(transfer_calls) == 1
+    assert transfer_calls[0] == {
+        "fileitem": subtitle_item,
+        "mediainfo": mediainfo,
+        "mtype": MediaType.TV,
+        "downloader": "qb",
+        "download_hash": "hash123",
+        "background": True,
+    }
 
 
 def test_download_single_supplements_category_before_download_event(monkeypatch):
@@ -708,11 +874,11 @@ def test_batch_download_rejects_complete_coverage_when_files_do_not_cover_target
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[],
-                total_episode=143,
-                start_episode=1,
-                require_complete_coverage=True,
+            season=1,
+            episodes=[],
+            total_episode=143,
+            start_episode=1,
+            require_complete_coverage=True,
         ),
     )
 
@@ -745,11 +911,11 @@ def test_batch_download_preserves_special_season_zero(monkeypatch):
     no_exists = _tv_no_exists(
         0,
         NotExistMediaInfo(
-                season=0,
-                episodes=[],
-                total_episode=6,
-                start_episode=1,
-                require_complete_coverage=True,
+            season=0,
+            episodes=[],
+            total_episode=6,
+            start_episode=1,
+            require_complete_coverage=True,
         ),
     )
 
@@ -779,11 +945,11 @@ def test_batch_download_rejects_complete_coverage_when_only_missing_episodes_mat
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[4, 5],
-                total_episode=5,
-                start_episode=1,
-                require_complete_coverage=True,
+            season=1,
+            episodes=[4, 5],
+            total_episode=5,
+            start_episode=1,
+            require_complete_coverage=True,
         ),
     )
 
@@ -816,10 +982,10 @@ def test_batch_download_tries_next_episode_candidate_when_first_download_fails(m
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[1],
-                total_episode=1,
-                start_episode=1,
+            season=1,
+            episodes=[1],
+            total_episode=1,
+            start_episode=1,
         ),
     )
 
@@ -914,10 +1080,10 @@ def test_batch_download_applies_custom_words_to_torrent_file_episodes(monkeypatc
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[170],
-                total_episode=200,
-                start_episode=155,
+            season=1,
+            episodes=[170],
+            total_episode=200,
+            start_episode=155,
         ),
     )
     custom_words = (
@@ -1212,11 +1378,11 @@ def test_batch_download_accepts_complete_coverage_when_files_cover_target_range(
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[],
-                total_episode=143,
-                start_episode=100,
-                require_complete_coverage=True,
+            season=1,
+            episodes=[],
+            total_episode=143,
+            start_episode=100,
+            require_complete_coverage=True,
         ),
     )
 
@@ -1247,11 +1413,11 @@ def test_batch_download_rejects_complete_coverage_when_files_have_same_count_but
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[],
-                total_episode=143,
-                start_episode=100,
-                require_complete_coverage=True,
+            season=1,
+            episodes=[],
+            total_episode=143,
+            start_episode=100,
+            require_complete_coverage=True,
         ),
     )
 
@@ -1282,11 +1448,11 @@ def test_batch_download_accepts_complete_coverage_when_title_episodes_cover_targ
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[],
-                total_episode=143,
-                start_episode=1,
-                require_complete_coverage=True,
+            season=1,
+            episodes=[],
+            total_episode=143,
+            start_episode=1,
+            require_complete_coverage=True,
         ),
     )
 
@@ -1318,11 +1484,11 @@ def test_batch_download_rejects_complete_coverage_when_title_episodes_are_partia
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[],
-                total_episode=143,
-                start_episode=1,
-                require_complete_coverage=True,
+            season=1,
+            episodes=[],
+            total_episode=143,
+            start_episode=1,
+            require_complete_coverage=True,
         ),
     )
 
@@ -1355,11 +1521,11 @@ def test_batch_download_complete_coverage_ignores_allowed_episode_narrowing(monk
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[],
-                total_episode=12,
-                start_episode=1,
-                require_complete_coverage=True,
+            season=1,
+            episodes=[],
+            total_episode=12,
+            start_episode=1,
+            require_complete_coverage=True,
         ),
     )
 
@@ -1370,6 +1536,122 @@ def test_batch_download_complete_coverage_ignores_allowed_episode_narrowing(monk
     assert context.confirmed_full_coverage is False
     chain.download_torrent.assert_not_called()
     chain.download_single.assert_not_called()
+
+
+def test_batch_download_skips_multi_episode_pack_outside_upgrade_allowlist(monkeypatch):
+    """分集洗版只允许 E20/E21 时，已达上限的 E01-E03 整包不得进入下载器。"""
+    _FakeBatchTorrentHelper.episodes = [1, 2, 3]
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
+
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
+    chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
+    chain.download_single = MagicMock(return_value="hash")
+
+    context = _build_tv_context(episode_list=[1, 2, 3])
+    context.allowed_episodes = {20, 21}
+    no_exists = _tv_no_exists(
+        1,
+        NotExistMediaInfo(season=1, episodes=list(range(1, 22)), total_episode=21),
+    )
+
+    downloads, lefts = chain.batch_download(contexts=[context], no_exists=no_exists)
+
+    assert downloads == []
+    assert lefts == no_exists
+    chain.download_single.assert_not_called()
+
+
+def test_batch_download_complete_coverage_pack_respects_upgrade_allowlist(monkeypatch):
+    """完整覆盖任务不能让部分剧集获准的显式整包绕过分集洗版限制。"""
+    _FakeBatchTorrentHelper.episodes = []
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
+
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
+    chain.download_single = MagicMock(return_value="hash")
+
+    context = _build_tv_context(episode_list=[1, 2, 3])
+    context.allowed_episodes = {3}
+    no_exists = _tv_no_exists(
+        1,
+        NotExistMediaInfo(
+            season=1,
+            episodes=[],
+            total_episode=3,
+            require_complete_coverage=True,
+        ),
+    )
+
+    downloads, lefts = chain.batch_download(contexts=[context], no_exists=no_exists)
+
+    assert downloads == []
+    assert lefts == no_exists
+    chain.download_single.assert_not_called()
+
+
+def test_batch_download_skips_unlabelled_full_pack_outside_upgrade_allowlist(monkeypatch):
+    """标题无集号的整季包也不能绕过分集洗版的允许集下载已达上限剧集。"""
+    _FakeBatchTorrentHelper.episodes = [1, 2, 3]
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
+
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
+    chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
+    chain.download_single = MagicMock(return_value="hash")
+
+    context = _build_tv_context()
+    context.allowed_episodes = {3}
+    no_exists = _tv_no_exists(
+        1,
+        NotExistMediaInfo(season=1, episodes=[], total_episode=3),
+    )
+
+    downloads, lefts = chain.batch_download(contexts=[context], no_exists=no_exists)
+
+    assert downloads == []
+    assert lefts == no_exists
+    chain.download_torrent.assert_not_called()
+    chain.download_single.assert_not_called()
+
+
+@pytest.mark.parametrize("torrent_episodes, downloaded", [([1, 2, 3], True), ([1, 2, 3, 4], False)])
+def test_batch_download_unlabelled_full_pack_checks_actual_episode_allowlist(
+    monkeypatch, torrent_episodes, downloaded
+):
+    """整季目标均获准时可下载，但种子文件多出未获准剧集时须跳过。"""
+    _FakeBatchTorrentHelper.episodes = torrent_episodes
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
+
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
+    chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
+    chain.download_single = MagicMock(return_value="hash")
+
+    context = _build_tv_context()
+    context.allowed_episodes = {1, 2, 3}
+    no_exists = _tv_no_exists(
+        1,
+        NotExistMediaInfo(season=1, episodes=[], total_episode=3),
+    )
+
+    downloads, lefts = chain.batch_download(contexts=[context], no_exists=no_exists)
+
+    assert downloads == ([context] if downloaded else [])
+    assert lefts == ({} if downloaded else no_exists)
+    assert chain.download_single.call_count == int(downloaded)
 
 
 def test_batch_download_keeps_count_check_without_complete_coverage(monkeypatch):
@@ -1391,10 +1673,10 @@ def test_batch_download_keeps_count_check_without_complete_coverage(monkeypatch)
     no_exists = _tv_no_exists(
         1,
         NotExistMediaInfo(
-                season=1,
-                episodes=[],
-                total_episode=143,
-                start_episode=1,
+            season=1,
+            episodes=[],
+            total_episode=143,
+            start_episode=1,
         ),
     )
 
@@ -1443,3 +1725,112 @@ def test_downloading_includes_media_type_and_source_site(monkeypatch):
     assert torrent.site_name == "示例站点"
     assert torrent.userid == "user-1"
     assert torrent.username == "tester"
+
+
+def _prepared_download_for_settle(download_dir: Path) -> download_submission._PreparedDownload:
+    """构造仅用于下载结算路径断言的准备事实。"""
+    file_name = "The.Ordinary.Jackpot.S01E01.1080p.mkv"
+    return download_submission._PreparedDownload(
+        torrent=TorrentInfo(title=file_name),
+        media=MediaInfo(type=MediaType.TV, title="中头奖还是要上班"),
+        meta=MetaInfo(file_name),
+        torrent_content=b"torrent",
+        folder_name="",
+        file_list=[file_name],
+        download_dir=download_dir,
+        download_uri=download_dir.as_posix(),
+        download_episodes=None,
+        site_downloader="qb",
+    )
+
+
+def _settle_accepted_download(chain, download_dir: Path) -> None:
+    """以固定下载上下文调用一次成功结算。"""
+    chain._settle_accepted_download(
+        prepared=_prepared_download_for_settle(download_dir),
+        context=Context(),
+        episodes=None,
+        channel=None,
+        source="subscribe",
+        userid=None,
+        username="admin",
+        custom_words=None,
+        actual_downloader="qb",
+        download_hash="hash123",
+        layout="NoSubfolder",
+    )
+
+
+def test_settle_accepted_download_uses_downloader_actual_save_dir():
+    """下载器中已存在同 Hash 任务时，下载历史须落到下载器实际保存目录。"""
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.list_torrents = MagicMock(return_value=[DownloaderTorrent(
+        hash="hash123",
+        downloader="qb",
+        save_path="/volume4/flow",
+        content_path="/volume4/flow/The.Ordinary.Jackpot.S01E01.1080p.mkv",
+    )])
+    chain._settle_download_success = MagicMock()
+
+    _settle_accepted_download(chain, Path("/volume5/PT/downloads/TV/日韩剧"))
+
+    assert chain._settle_download_success.call_args.kwargs["download_dir"] == Path("/volume4/flow")
+    chain.list_torrents.assert_called_once_with(hashs=["hash123"], downloader="qb")
+
+
+def test_settle_accepted_download_keeps_expected_dir_without_downloader_task():
+    """下载器查询不到任务时保持预期目录，不改变既有结算行为。"""
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.list_torrents = MagicMock(return_value=[])
+    chain._settle_download_success = MagicMock()
+
+    _settle_accepted_download(chain, Path("/downloads/TV"))
+
+    assert chain._settle_download_success.call_args.kwargs["download_dir"] == Path("/downloads/TV")
+
+
+def test_settle_accepted_download_falls_back_when_downloader_lookup_fails():
+    """下载器查询失败时回退预期目录，不能因回读失败阻断下载结算。"""
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.list_torrents = MagicMock(side_effect=RuntimeError("downloader unavailable"))
+    chain._settle_download_success = MagicMock()
+
+    _settle_accepted_download(chain, Path("/downloads/TV"))
+
+    assert chain._settle_download_success.call_args.kwargs["download_dir"] == Path("/downloads/TV")
+
+
+def test_settle_accepted_download_skips_lookup_for_remote_dir():
+    """远程存储保存目录不由本地回读，保持预期值且不查询下载器。"""
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.list_torrents = MagicMock(return_value=[])
+    chain._settle_download_success = MagicMock()
+
+    _settle_accepted_download(chain, Path("smb:/downloads/TV"))
+
+    assert chain._settle_download_success.call_args.kwargs["download_dir"] == Path("smb:/downloads/TV")
+    chain.list_torrents.assert_not_called()
+
+
+def test_settle_accepted_download_records_actual_path_for_existing_torrent():
+    """复现刷流先下载场景：下载历史与文件明细须记录下载器实际路径。"""
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.runtime_config = SimpleNamespace(media_extensions=(".mkv",))
+    chain.durable_event_writer = None
+    chain.download_history_repository = MagicMock()
+    chain._build_download_notification = MagicMock(return_value=None)
+    chain._submit_download_added_task = MagicMock()
+    chain.eventmanager = MagicMock()
+    chain.list_torrents = MagicMock(return_value=[DownloaderTorrent(
+        hash="hash123",
+        downloader="qb",
+        save_path="/volume4/flow",
+        content_path="/volume4/flow/The.Ordinary.Jackpot.S01E01.1080p.mkv",
+    )])
+
+    _settle_accepted_download(chain, Path("/volume5/PT/downloads/TV/日韩剧"))
+
+    history, files = chain.download_history_repository.add.call_args.args
+    assert history.path == "/volume4/flow/The.Ordinary.Jackpot.S01E01.1080p.mkv"
+    assert files[0].fullpath == "/volume4/flow/The.Ordinary.Jackpot.S01E01.1080p.mkv"
+    assert files[0].savepath == "/volume4/flow"

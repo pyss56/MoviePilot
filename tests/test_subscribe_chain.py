@@ -15,7 +15,7 @@ from app.application.subscription.contract import (
 )
 from app.application.subscription.mutation import SubscriptionMutation
 from app.schemas.mediaserver import NotExistMediaInfo
-from app.schemas.types import MediaSource, MediaType
+from app.schemas.types import MUSIC_ENTITY_ALBUM, MediaSource, MediaType
 
 
 def _load_subscribe_chain_class():
@@ -699,6 +699,19 @@ class TestSubscribeChain:
 
         assert progress == "第0季"
 
+    def test_format_subscribe_progress_shows_accumulated_album_tracks(self):
+        """消息订阅列表应像电视剧一样显示专辑已累计曲目进度。"""
+        subscribe = self._build_subscribe(
+            type=MediaType.MUSIC.value,
+            music_type=MUSIC_ENTITY_ALBUM,
+            total_tracks=11,
+            downloaded_tracks=["[1,1]", "[1,2]", "[1,2]"],
+        )
+
+        progress = SubscribeInteractionHandler._format_subscribe_progress(subscribe)
+
+        assert progress == "专辑 [2/11]"
+
     def test_match_title_fallback_calls_torrent_match_from_class(self):
         """确保标题兜底匹配不依赖 TorrentHelper 实例绑定。"""
         reached = []
@@ -985,6 +998,48 @@ class TestSubscribeChain:
         assert result["media-key"][1].episodes == []
         assert result["media-key"][1].start_episode == 1
         assert result["media-key"][1].total_episode == 48
+
+    def test_resolve_subscribe_missing_uses_subscription_season_when_meta_has_none(self):
+        """搜索词未携带季号时，开始集数裁剪必须覆盖原缺失季键。"""
+        subscribe = self._build_subscribe(
+            best_version=0,
+            start_episode=239,
+            total_episode=240,
+            lack_episode=4,
+        )
+        meta = SimpleNamespace(type=MediaType.TV, begin_season=None, season=None)
+        mediainfo = SimpleNamespace(
+            type=MediaType.TV,
+            seasons={1: list(range(1, 241))},
+            title_year="Test Show (2026)",
+        )
+        library_missing = {
+            1: {
+                1: SimpleNamespace(
+                    season=1,
+                    episodes=[1, 2, 239, 240],
+                    total_episode=240,
+                    start_episode=1,
+                    require_complete_coverage=False,
+                )
+            }
+        }
+
+        class _DownloadChain:
+            def get_no_exists_info(self, **_kwargs):
+                return False, library_missing
+
+        with patch.object(SUBSCRIBE_CHAIN_MODULE, "DownloadChain", _DownloadChain):
+            satisfied, no_exists = SubscribeChain().resolve_subscribe_missing(
+                subscribe=subscribe,
+                meta=meta,
+                mediainfo=mediainfo,
+                mediakey=1,
+            )
+
+        assert not (satisfied)
+        assert set(no_exists[1]) == {1}
+        assert set(no_exists[1][1].episodes) == {239, 240}
 
     def test_resolve_subscribe_missing_combines_library_gap_and_download_history_without_side_effects(self):
         """目标满足查询应复用主程序媒体库缺集与订阅下载历史的合并口径，且不推进订阅状态。"""

@@ -5,10 +5,10 @@
 
 ## Result
 
-- OpenAPI HTTP operations: **401**
-- Stable `moviepilot_api` operations: **221**
-- Exact HTTP routes used by the gateway: **219**
-- OpenAPI routes matched directly by the gateway: **218**
+- OpenAPI HTTP operations: **421**
+- Stable `moviepilot_api` operations: **231**
+- Exact HTTP routes used by the gateway: **229**
+- OpenAPI routes matched directly by the gateway: **228**
 - Bounded dynamic gateway routes: **1**
 - Every gateway operation has a generated English oneOf input contract in MCP `tools/list` and `skills/moviepilot-api/SKILL.md`.
 - Every non-gateway OpenAPI operation is listed below with an explicit ownership boundary; it is not silently callable through arbitrary URL/method input.
@@ -19,10 +19,10 @@
 | :--- | ---: | :--- |
 | `alternate-auth-duplicate` | 11 | API-token compatibility duplicate of a bearer-authenticated capability. |
 | `consolidated` | 71 | Source/UI route represented by a stable aggregate Agent operation. |
-| `gateway` | 218 | Approved structured MoviePilot Agent operation. |
+| `gateway` | 228 | Approved structured MoviePilot Agent operation. |
 | `provider-skill` | 12 | Low-level downloader or media-server capability owned by a provider Skill. |
 | `stream_or_binary` | 10 | Streaming or binary response owned by a direct client transport. |
-| `transport_or_identity` | 66 | Authentication, protocol, callback, account, or conversation transport boundary. |
+| `transport_or_identity` | 76 | Authentication, protocol, callback, account, or conversation transport boundary. |
 | `ui_presentation` | 13 | Frontend or plugin-rendered presentation contract. |
 
 ## Bounded Dynamic Routes
@@ -93,6 +93,11 @@
 | `DELETE` | `/api/v1/download/{hashString}` | download | `provider-skill` | downloader-operation | 删除下载任务 |
 | `PATCH` | `/api/v1/download/{hashString}` | download | `provider-skill` | downloader-operation | 高级更新下载任务 |
 | `POST` | `/api/v1/download/{hashString}/classify-source` | download | `provider-skill` | downloader-operation | 识别并归类已有下载任务 |
+| `POST` | `/api/v1/github/auth/manual` | github | `transport_or_identity` | host-runtime | 保存手动 GitHub Token |
+| `POST` | `/api/v1/github/auth/poll` | github | `transport_or_identity` | host-runtime | 轮询 GitHub 设备授权 |
+| `POST` | `/api/v1/github/auth/start` | github | `transport_or_identity` | host-runtime | 启动 GitHub 设备授权 |
+| `GET` | `/api/v1/github/auth/status` | github | `transport_or_identity` | host-runtime | 查询 GitHub Token 状态 |
+| `DELETE` | `/api/v1/github/auth/token` | github | `transport_or_identity` | host-runtime | 清除 GitHub Token |
 | `DELETE` | `/api/v1/history/download` | history | `gateway` | download.history.delete | 删除下载历史记录 |
 | `GET` | `/api/v1/history/download` | history | `gateway` | download.history.list | 查询下载历史记录 |
 | `DELETE` | `/api/v1/history/transfer` | history | `gateway` | transfer.history.delete | 删除整理记录 |
@@ -105,6 +110,11 @@
 | `POST` | `/api/v1/llm/manage` | llm | `transport_or_identity` | host-runtime | LLM提供商统一管理 |
 | `GET` | `/api/v1/llm/provider-auth/callback/{provider_id}` | llm | `transport_or_identity` | host-runtime | LLM提供商OAuth回调 |
 | `POST` | `/api/v1/login/access-token` | login | `transport_or_identity` | host-runtime | 获取token |
+| `POST` | `/api/v1/login/github-auth/manual` | login | `transport_or_identity` | host-runtime | 从初始化页保存手动 GitHub Token |
+| `POST` | `/api/v1/login/github-auth/poll` | login | `transport_or_identity` | host-runtime | 从初始化页轮询 GitHub 设备授权 |
+| `POST` | `/api/v1/login/github-auth/start` | login | `transport_or_identity` | host-runtime | 从初始化页启动 GitHub 设备授权 |
+| `GET` | `/api/v1/login/github-auth/status` | login | `transport_or_identity` | host-runtime | 查询初始化阶段 GitHub Token 状态 |
+| `DELETE` | `/api/v1/login/github-auth/token` | login | `transport_or_identity` | host-runtime | 从初始化页清除 GitHub Token |
 | `GET` | `/api/v1/login/initialization` | login | `transport_or_identity` | host-runtime | 查询首次初始化状态 |
 | `POST` | `/api/v1/login/initialization` | login | `transport_or_identity` | host-runtime | 完成首次初始化 |
 | `GET` | `/api/v1/login/wallpaper` | login | `transport_or_identity` | host-runtime | 登录页面电影海报 |
@@ -193,6 +203,7 @@
 | `POST` | `/api/v1/openai/v1/responses` | openai | `transport_or_identity` | host-runtime | OpenAI compatible responses |
 | `GET` | `/api/v1/plugin/` | plugin | `gateway` | plugin.installed, plugin.market | 所有插件 |
 | `POST` | `/api/v1/plugin/clone/{plugin_id}` | plugin | `gateway` | plugin.clone | 创建插件分身 |
+| `GET` | `/api/v1/plugin/clone/{plugin_id}/restorable` | plugin | `gateway` | plugin.clone.restorable | 列出可恢复的已停用分身 |
 | `GET` | `/api/v1/plugin/dashboard/meta` | plugin | `ui_presentation` | host-ui | 获取所有插件仪表板元信息 |
 | `GET` | `/api/v1/plugin/dashboard/{plugin_id}` | plugin | `ui_presentation` | host-ui | 获取插件仪表板配置 |
 | `GET` | `/api/v1/plugin/dashboard/{plugin_id}/{key}` | plugin | `ui_presentation` | host-ui | 获取插件仪表板配置 |
@@ -209,6 +220,13 @@
 | `GET` | `/api/v1/plugin/history/{plugin_id}` | plugin | `gateway` | plugin.history | 获取插件更新说明 |
 | `GET` | `/api/v1/plugin/install/{plugin_id}` | plugin | `gateway` | plugin.install | 安装插件 |
 | `GET` | `/api/v1/plugin/installed` | plugin | `consolidated` | plugin.installed | 已安装插件 |
+| `POST` | `/api/v1/plugin/instance/{instance_id}/enabled` | plugin | `gateway` | plugin.instance.set_enabled | 启用或停用插件实例 |
+| `POST` | `/api/v1/plugin/instance/{instance_id}/purge` | plugin | `gateway` | plugin.instance.purge | 按选定范围彻底清理插件实例 |
+| `DELETE` | `/api/v1/plugin/instances/{plugin_id}/{instance_id}/default_target` | plugin | `gateway` | plugin.default_target.clear | 清除插件实例的默认调用目标 |
+| `PUT` | `/api/v1/plugin/instances/{plugin_id}/{instance_id}/default_target` | plugin | `gateway` | plugin.default_target.set | 设置插件实例的默认调用目标 |
+| `GET` | `/api/v1/plugin/loglevel/{plugin_id}` | plugin | `gateway` | plugin.loglevel.get | 查询插件全部实例的日志等级设置 |
+| `DELETE` | `/api/v1/plugin/loglevel/{plugin_id}/{instance_id}` | plugin | `gateway` | plugin.loglevel.clear | 清除插件实例的日志等级覆盖 |
+| `PUT` | `/api/v1/plugin/loglevel/{plugin_id}/{instance_id}` | plugin | `gateway` | plugin.loglevel.set | 设置插件实例的日志等级覆盖 |
 | `GET` | `/api/v1/plugin/page/{plugin_id}` | plugin | `ui_presentation` | host-ui | 获取插件数据页面 |
 | `GET` | `/api/v1/plugin/rating` | plugin | `gateway` | plugin.ratings | 批量查询插件评分 |
 | `GET` | `/api/v1/plugin/rating/{plugin_id}` | plugin | `gateway` | plugin.rating | 查询插件评分 |
@@ -372,6 +390,8 @@
 | `POST` | `/api/v1/system/setting/{key}` | system | `consolidated` | config.system.update | 更新系统设置 |
 | `GET` | `/api/v1/system/settings` | system | `gateway` | config.system.get | Discover or read registered system settings |
 | `POST` | `/api/v1/system/settings` | system | `gateway` | config.system.update | Update one registered system setting |
+| `GET` | `/api/v1/system/settings/catalog` | system | `gateway` | config.system.list | List system setting contracts |
+| `GET` | `/api/v1/system/settings/describe/{setting_key}` | system | `gateway` | config.system.describe | Describe one system setting contract |
 | `POST` | `/api/v1/system/update/check` | system | `gateway` | system.update.check | 立即检查系统更新 |
 | `POST` | `/api/v1/system/update/download` | system | `gateway` | system.update.download | 后台下载系统更新 |
 | `POST` | `/api/v1/system/update/install` | system | `gateway` | system.update.install | 确认重启安装系统更新 |

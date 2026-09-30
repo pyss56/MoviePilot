@@ -93,6 +93,7 @@ RUN apt-get update \
     supervisor \
     postgresql-client-18 \
     libchromaprint-tools \
+    libevent-2.1-7t64 \
     libjemalloc2 \
     && dpkg-reconfigure --frontend noninteractive tzdata \
     && ln -s /usr/lib/*-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc.so \
@@ -230,13 +231,7 @@ RUN set -eu; \
     plugin_root="$(find /tmp/plugins-src -mindepth 1 -maxdepth 1 -type d -print -quit)"; \
     test -n "${plugin_root}"; \
     mkdir -p /plugins; \
-    cp -a "${plugin_root}/plugins.v2/." /plugins/; \
-    jq -r 'to_entries[] | select(.value.v2 == true) | .key' "${plugin_root}/package.json" | awk '{print tolower($0)}' | \
-    while read -r plugin_id; do \
-        if [ ! -d "/plugins/${plugin_id}" ]; then \
-            cp -a "${plugin_root}/plugins/${plugin_id}" /plugins/; \
-        fi; \
-    done
+    cp -a "${plugin_root}/plugins.v3/." /plugins/
 
 
 # 准备站点资源
@@ -290,7 +285,12 @@ RUN mkdir -p \
 # final 阶段: 安装运行时依赖和配置最终镜像
 FROM prepare_package AS final
 
+# jemalloc 默认按 CPU 数×4 建 arena，空闲 arena 的脏页会长期计入 RSS。脏页按 5 秒衰减归还
+# （muzzy 直接归还，避免 MADV_FREE 页继续计入 RSS）；arena 限制为 8 个，带 GIL 的 Python 大块分配竞争很小。
+# 后台回收线程由主进程启动时自行开启，不能写在这里：子进程继承 MALLOC_CONF 后 Chromium 无法启动。
+# 用户可在 compose 中覆盖 MALLOC_CONF。
 ENV LD_PRELOAD="/usr/local/lib/libjemalloc.so" \
+    MALLOC_CONF="narenas:8,dirty_decay_ms:5000,muzzy_decay_ms:0" \
     MOVIEPILOT_DOCKER_SUPERVISOR="true"
 
 # 引入支持 amr 编码的静态 ffmpeg
@@ -305,7 +305,15 @@ COPY --from=uv /uv /usr/local/bin/uv
 # 浏览器运行依赖
 RUN playwright install-deps chromium \
     && apt-get update \
-    && apt-get install -y --no-install-recommends libde265-0 \
+    && apt-get install -y --no-install-recommends \
+    gzip \
+    libde265-0 \
+    libpcre2-8-0 \
+    libsqlite3-0 \
+    nginx \
+    nginx-common \
+    xserver-common \
+    xvfb \
     && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf \

@@ -1,5 +1,5 @@
 """
-覆盖 app/application/history.py 的整理历史查重闸。
+覆盖 app/application/history/ 的整理历史查重闸。
 
 监控分发（app/monitor/dispatcher.py）与整理链计划整理 owner（app/chain/transfer/plan.py）
 共用这套判定，本文件只测判定本身的真值表与查询辅助函数，不涉及调用方。
@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.application import history as transfer_history_helper
-from app.application.history import (
+from app.application.history import retry as transfer_history_helper
+from app.application.history.retry import (
     HistoryGateAction,
     clear_transfer_failures,
     coerce_size,
@@ -27,8 +27,8 @@ from app.runtime.config import settings
 
 
 def make_history(status: bool, size=1024, has_src_fileitem: bool = True,
-                  history_id: int = 1, src_fileitem_override=None,
-                  src=None, src_storage=None, modify_time=None, fileid=None):
+                 history_id: int = 1, src_fileitem_override=None,
+                 src=None, src_storage=None, modify_time=None, fileid=None):
     """构造用于查重闸判定的整理记录替身。"""
     if src_fileitem_override is not None:
         src_fileitem = src_fileitem_override
@@ -41,7 +41,7 @@ def make_history(status: bool, size=1024, has_src_fileitem: bool = True,
     else:
         src_fileitem = None
     return SimpleNamespace(id=history_id, status=status, src_fileitem=src_fileitem,
-                            src=src, src_storage=src_storage)
+                           src=src, src_storage=src_storage)
 
 
 def _reset_failed_retries(src_path, storage=None):
@@ -77,6 +77,28 @@ def test_evaluate_history_gate_skips_when_success_size_unchanged():
     action = evaluate_history_gate(history, file_size=1024)
 
     assert action == HistoryGateAction.SKIP
+
+
+@pytest.mark.parametrize(
+    "current_modify_time, expected",
+    [
+        (101.0, HistoryGateAction.SKIP),
+        (101.01, HistoryGateAction.PASS_SIZE_CHANGED),
+    ],
+)
+def test_evaluate_history_gate_uses_tolerance_for_modify_time(
+        current_modify_time, expected,
+):
+    """修改时间变化不超过 1 秒时应保持原版本，超过 1 秒仍应放行。"""
+    history = make_history(status=True, size=1024, modify_time=100.0)
+
+    action = evaluate_history_gate(
+        history,
+        file_size=1024,
+        file_modify_time=current_modify_time,
+    )
+
+    assert action == expected
 
 
 def test_evaluate_history_gate_skips_when_recorded_size_missing():
@@ -553,7 +575,7 @@ def test_describe_history_gate_reports_failed_status_with_retry_progress(monkeyp
         record_transfer_failure(src_path, "local")
         record_transfer_failure(src_path, "local")
         history = make_history(status=False, size=1024, history_id=5,
-                                src=src_path, src_storage="local")
+                               src=src_path, src_storage="local")
 
         description = describe_history_gate(history, file_size=1024)
 

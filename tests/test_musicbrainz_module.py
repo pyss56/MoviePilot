@@ -831,7 +831,7 @@ def test_request_json_caches_repeated_calls(monkeypatch):
     )
     network_calls = {"count": 0}
 
-    def fake_get_res(_self, url, params=None):
+    def fake_get_res(_self, url, params=None, **_kwargs):
         """记录网络调用次数并返回固定的录音详情。"""
         network_calls["count"] += 1
         return _FakeMusicBrainzResponse({"id": "recording-cache", "title": "晴天"})
@@ -856,7 +856,7 @@ def test_request_json_caches_not_found(monkeypatch):
     )
     network_calls = {"count": 0}
 
-    def fake_get_res(_self, url, params=None):
+    def fake_get_res(_self, url, params=None, **_kwargs):
         """始终返回 404，用于验证稳定不存在结果会被缓存。"""
         network_calls["count"] += 1
         return _FakeMusicBrainzResponse(None, status_code=404)
@@ -886,7 +886,7 @@ def test_request_json_retries_on_server_busy(monkeypatch):
         _FakeMusicBrainzResponse({"id": "recording-busy", "title": "晴天"}),
     ]
 
-    def fake_get_res(_self, url, params=None):
+    def fake_get_res(_self, url, params=None, **_kwargs):
         """依次返回繁忙与成功响应，验证重试后拿到结果。"""
         return responses.pop(0)
 
@@ -1168,6 +1168,28 @@ def test_select_candidate_rejects_wrong_artist_same_title():
     )
 
     assert MusicBrainzModule._select_candidate(meta, [wrong_artist], media_source="musicbrainz") is None
+
+
+def test_select_candidate_rejects_wrong_release_year_and_album():
+    """曲名和艺人相同也不能把有明确专辑证据的原版投影到其他发行版。"""
+    meta = MetaMusic(
+        title="Sparks Fly",
+        artists=["Taylor Swift"],
+        album="Speak Now",
+        year=2010,
+    )
+    wrong_release = MusicInfo(
+        media_source="musicbrainz",
+        media_id="recording-wrong-release",
+        title="Sparks Fly",
+        artists=["Taylor Swift"],
+        album="Now That's What I Call Music",
+        year=2025,
+    )
+
+    assert MusicBrainzModule._select_candidate(
+        meta, [wrong_release], media_source="musicbrainz"
+    ) is None
 
 
 def test_select_candidate_rejects_artist_only_match():

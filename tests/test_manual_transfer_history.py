@@ -12,6 +12,8 @@ from app.api.endpoints.transfer import (
 )
 from app.application.history import (
     TransferHistoryWrite,
+)
+from app.application.history.retry import (
     clear_transfer_failures,
     failed_retry_count,
     max_failed_retries,
@@ -150,12 +152,12 @@ def _patch_transfer_planning(monkeypatch, chain, fileitem, history, planned, del
         ),
     )
     monkeypatch.setattr("app.chain.transfer.records.StorageChain", lambda: SimpleNamespace(
-            exists=lambda current_fileitem: True,
-            delete_media_file=lambda current_fileitem: deleted.append(
-                ("target", current_fileitem.path)
-            )
-            or True,
-        ))
+        exists=lambda current_fileitem: True,
+        delete_media_file=lambda current_fileitem: deleted.append(
+            ("target", current_fileitem.path)
+        )
+        or True,
+    ))
     monkeypatch.setattr(
         "app.chain.transfer.request.MetaInfoPath",
         lambda path, custom_words=None, **kwargs: FakeMeta(1),

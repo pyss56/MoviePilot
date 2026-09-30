@@ -199,7 +199,6 @@ class MetaBase(object):
     # 帧率信息（纯数值）
     fps: Optional[int] = None
 
-
     # 副标题解析
     _subtitle_flag = False
     _title_episodel_re = r"Episode\s+(\d{1,4})"
@@ -574,7 +573,7 @@ class MetaBase(object):
             ret_string = f"{ret_string} {self.resource_effect}"
         if self.resource_pix:
             ret_string = f"{ret_string} {self.resource_pix}"
-        return ret_string
+        return ret_string.strip()
 
     @property
     def edition(self) -> str:

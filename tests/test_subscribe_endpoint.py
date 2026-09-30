@@ -96,6 +96,26 @@ class TestSubscribeEndpoint:
     订阅接口回归测试。
     """
 
+    def test_subscribe_fork_response_preserves_created_subscription_id(self):
+        """复用订阅的响应模型必须允许返回新建订阅 ID。"""
+        from app.api.endpoints import subscribe as subscribe_endpoint
+        from app.schemas.common import IdData
+        from app.schemas.response import Response
+
+        route = next(
+            route
+            for route in subscribe_endpoint.router.routes
+            if route.path == "/fork" and "POST" in route.methods
+        )
+        payload = Response[IdData](
+            success=True,
+            data=IdData(id=2),
+        ).model_dump()
+
+        response = route.response_model.model_validate(payload)
+
+        assert response.data.id == 2
+
     def test_read_subscribes_scopes_regular_user_and_keeps_superuser_global(self):
         """
         普通用户只能看到自己创建的订阅，超级用户保留全局视图。
@@ -598,6 +618,192 @@ class TestSubscribeEndpoint:
         assert result.id is None
         repository.async_list_by_title.assert_not_awaited()
 
+    def test_subscribe_media_identity_falls_back_to_video_metadata(self):
+        """豆瓣身份未命中时，电影应按类型、标题和年份匹配已有订阅。"""
+        from app.api.endpoints.subscribe import subscribe_media_identity
+
+        other_year = _EndpointSubscribe(
+            id=31,
+            username="alice",
+            name="跨来源电影",
+            year="2024",
+            type=MediaType.MOVIE.value,
+            media_source=MediaSource.TMDB,
+            media_id="tmdb-2024",
+        )
+        matched = _EndpointSubscribe(
+            id=32,
+            username="alice",
+            name="跨来源电影",
+            year="2025",
+            type=MediaType.MOVIE.value,
+            media_source=MediaSource.TMDB,
+            media_id="tmdb-2025",
+        )
+        inaccessible_exact = _EndpointSubscribe(
+            id=30,
+            username="bob",
+            name="跨来源电影",
+            year="2025",
+            type=MediaType.MOVIE.value,
+            media_source=MediaSource.Douban,
+            media_id="douban-2025",
+        )
+        repository = _SubscriptionRepositoryFake(inaccessible_exact, other_year, matched)
+
+        result = asyncio.run(
+            subscribe_media_identity(
+                media_id="douban-2025",
+                media_source=MediaSource.Douban,
+                title="跨来源电影",
+                year="2025",
+                mtype=MediaType.MOVIE,
+                query=_subscription_query(repository),
+                current_user=_EndpointUser(name="alice", is_superuser=False),
+            )
+        )
+
+        assert result.id == 32
+        repository.async_list_by_title.assert_awaited_once_with(
+            title="跨来源电影",
+            season=None,
+        )
+
+    def test_subscribe_media_identity_falls_back_from_tmdb(self):
+        """TMDB 身份未命中时也应找到其它来源的同名同年订阅。"""
+        from app.api.endpoints.subscribe import subscribe_media_identity
+
+        repository = _SubscriptionRepositoryFake(
+            _EndpointSubscribe(
+                id=33,
+                username="alice",
+                name="同名电影",
+                year="2025",
+                type=MediaType.MOVIE.value,
+                media_source=MediaSource.Douban,
+                media_id="douban-same-title",
+            )
+        )
+
+        result = asyncio.run(
+            subscribe_media_identity(
+                media_id="missing-tmdb",
+                media_source=MediaSource.TMDB,
+                title="同名电影",
+                year="2025",
+                mtype=MediaType.MOVIE,
+                query=_subscription_query(repository),
+                current_user=_EndpointUser(name="alice", is_superuser=False),
+            )
+        )
+
+        assert result.id == 33
+        repository.async_list_by_title.assert_awaited_once_with(title="同名电影", season=None)
+
+    @pytest.mark.parametrize(
+        ("card_source", "subscription_source", "card_year"),
+        [
+            (MediaSource("iqiyidiscover"), MediaSource.TMDB, "2026"),
+            (MediaSource.TMDB, MediaSource("iqiyidiscover"), None),
+            (MediaSource.TMDB, MediaSource("iqiyidiscover"), ""),
+        ],
+    )
+    def test_subscribe_media_identity_matches_unknown_subscription_year(
+        self, card_source, subscription_source, card_year,
+    ):
+        """跨源卡片的年份可有可无，但订阅无年份时仍能回显。"""
+        from app.api.endpoints.subscribe import subscribe_media_identity
+
+        repository = _SubscriptionRepositoryFake(
+            _EndpointSubscribe(
+                id=34,
+                username="alice",
+                name="未定档剧",
+                year=None,
+                type=MediaType.TV.value,
+                media_source=subscription_source,
+                media_id="existing-id",
+                season=1,
+            )
+        )
+
+        result = asyncio.run(
+            subscribe_media_identity(
+                media_id="card-id",
+                media_source=card_source,
+                title="未定档剧 第一季",
+                year=card_year,
+                mtype=MediaType.TV,
+                query=_subscription_query(repository),
+                current_user=_EndpointUser(name="alice", is_superuser=False),
+            )
+        )
+
+        assert result.id == 34
+        repository.async_list_by_title.assert_awaited_once_with(title="未定档剧", season=1)
+
+    @pytest.mark.parametrize("card_year", [None, "", "2025"])
+    def test_subscribe_media_identity_rejects_conflicting_known_year(
+        self, card_year,
+    ):
+        """无年份卡片不能串到已定档剧，已知年份也不能匹配冲突年份。"""
+        from app.api.endpoints.subscribe import subscribe_media_identity
+
+        repository = _SubscriptionRepositoryFake(
+            _EndpointSubscribe(
+                id=35,
+                username="alice",
+                name="同名剧",
+                year="2024",
+                type=MediaType.TV.value,
+                media_source=MediaSource.Douban,
+                media_id="existing-id",
+            )
+        )
+        result = asyncio.run(
+            subscribe_media_identity(
+                media_id="card-id",
+                media_source=MediaSource.TMDB,
+                title="同名剧",
+                year=card_year,
+                mtype=MediaType.TV,
+                query=_subscription_query(repository),
+                current_user=_EndpointUser(name="alice", is_superuser=False),
+            )
+        )
+
+        assert result.id is None
+
+    def test_subscribe_media_identity_prefers_matching_year_over_unknown_year(self):
+        """同名订阅同时含已知和未知年份时，优先返回确切年份。"""
+        from app.api.endpoints.subscribe import subscribe_media_identity
+
+        repository = _SubscriptionRepositoryFake(
+            _EndpointSubscribe(
+                id=36, username="alice", name="同名剧", year=None,
+                type=MediaType.TV.value, media_source=MediaSource.Douban,
+                media_id="undated",
+            ),
+            _EndpointSubscribe(
+                id=37, username="alice", name="同名剧", year="2026",
+                type=MediaType.TV.value, media_source=MediaSource.Douban,
+                media_id="dated",
+            ),
+        )
+        result = asyncio.run(
+            subscribe_media_identity(
+                media_id="card-id",
+                media_source=MediaSource.TMDB,
+                title="同名剧",
+                year="2026",
+                mtype=MediaType.TV,
+                query=_subscription_query(repository),
+                current_user=_EndpointUser(name="alice", is_superuser=False),
+            )
+        )
+
+        assert result.id == 37
+
     def test_delete_subscribe_by_media_identity_deletes_owner_candidate(self):
         """
         按媒体删除端点应把媒体身份和当前用户交给应用命令。
@@ -937,6 +1143,7 @@ class TestSubscribeEndpoint:
             total_episode=10,
             lack_episode=3,
             note=[1, 2, 3],
+            completed_tracks=3,
             state="S",
             last_update="2026-07-20 12:00:00",
             username="forged-user",
@@ -968,6 +1175,7 @@ class TestSubscribeEndpoint:
             "episode_priority",
             "date",
             "completed_episode",
+            "completed_tracks",
         ):
             assert field not in payload
 

@@ -225,12 +225,12 @@ class ConfigModel(BaseModel):
     AUTH_SITE: str = ""
 
     # ==================== 数据库配置 ====================
-    # 数据库类型，支持 sqlite 和 postgresql，默认使用 sqlite
     # API 服务的 worker 进程数。连接池是进程级的，每个 worker 各持一份，
     # 数据库连接额度校验按它换算总用量。注意：当前主程序以单进程方式启动
     # （uvicorn.Config 的 workers 仅在多进程 supervisor 路径下生效），
     # 调大此项前需先解决调度器会在每个 worker 内重复执行的问题
     API_WORKERS: int = Field(default=1, ge=1)
+    # 数据库类型，支持 sqlite 和 postgresql，默认使用 sqlite
     DB_TYPE: str = "sqlite"
     # 是否在控制台输出 SQL 语句，默认关闭
     DB_ECHO: bool = False
@@ -329,10 +329,10 @@ class ConfigModel(BaseModel):
     CACHE_BACKEND_URL: Optional[str] = "redis://localhost:6379"
     # Redis 缓存最大内存限制，未配置时，如开启大内存模式时为 "1024mb"，未开启时为 "256mb"
     CACHE_REDIS_MAXMEMORY: Optional[str] = None
-    # Redis 连接池最大连接数
-    CACHE_REDIS_MAX_CONNECTIONS: int = 256
+    # Redis 单个连接池最大连接数；异步连接池按事件循环分别应用该上限
+    CACHE_REDIS_MAX_CONNECTIONS: int = 512
     # Redis 连接池耗尽时等待可用连接的时间（秒）
-    CACHE_REDIS_POOL_TIMEOUT: int = 3
+    CACHE_REDIS_POOL_TIMEOUT: int = 10
     # 全局图片缓存，将媒体图片缓存到本地
     GLOBAL_IMAGE_CACHE: bool = False
     # 全局图片缓存保留天数
@@ -391,6 +391,14 @@ class ConfigModel(BaseModel):
     # TMDB API Key
     TMDB_API_KEY: str = "db55323b8d3e4154498498a75642b381"
 
+    # ==================== Bangumi配置 ====================
+    # 是否启用 Bangumi 数据与图片代理
+    BANGUMI_PROXY_ENABLE: bool = False
+    # Bangumi API代理地址，留空使用官方地址
+    BANGUMI_API_DOMAIN: str = ""
+    # Bangumi图片代理地址，留空时由后端代理端点直接拉取原始图片
+    BANGUMI_IMAGE_DOMAIN: str = ""
+
     # ==================== 音乐配置 ====================
     # 音乐封面代理地址（用于解决 coverartarchive.org 无法访问导致的封面不显示问题，留空则使用官方地址）
     MUSIC_COVER_PROXY: str = ""
@@ -416,6 +424,7 @@ class ConfigModel(BaseModel):
     # ==================== TVDB配置 ====================
     # TVDB API Key
     TVDB_V4_API_KEY: str = "ed2aa66b-7899-4677-92a7-67bc9ce3d93a"
+    # TVDB V4 订阅 PIN
     TVDB_V4_API_PIN: str = ""
 
     # ==================== Fanart配置 ====================
@@ -668,8 +677,8 @@ class ConfigModel(BaseModel):
     MEDIA_RECOGNIZE_SHARE_API: Optional[str] = None
 
     # ==================== 个性化 ====================
-    # 登录页面壁纸来源：tmdb/bing/mediaserver/customize/static
-    WALLPAPER: str = "tmdb"
+    # 登录页面壁纸来源：空字符串表示无壁纸，另支持 tmdb/bing/mediaserver/customize/static
+    WALLPAPER: str = ""
     # 壁纸轮换间隔（秒），0 表示不轮换
     WALLPAPER_ROTATION_INTERVAL: int = 15
     # 静态壁纸地址，可使用前端可访问的本地路径或 URL
@@ -703,8 +712,11 @@ class ConfigModel(BaseModel):
     )
 
     # ==================== Github & PIP ====================
-    # Github token，提高请求api限流阈值 ghp_****
-    GITHUB_TOKEN: Optional[str] = None
+    # GitHub Token 供 Agent 提交 Issue/PR 和访问 API；原文只保留在服务端运行配置中
+    GITHUB_TOKEN: Annotated[
+        Optional[str],
+        SettingPolicy(sensitive=True),
+    ] = None
     # Github代理服务器，格式：https://mirror.ghproxy.com/
     GITHUB_PROXY: Optional[str] = ""
     # pip镜像站点，格式：https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
@@ -750,6 +762,9 @@ class ConfigModel(BaseModel):
             "bing.com",
             "doubanio.com",
             "lain.bgm.tv",
+            "bgm.tv",
+            "bangumi.tv",
+            "bangumi.lol",
             "raw.githubusercontent.com",
             "github.com",
             "thetvdb.com",
@@ -822,7 +837,7 @@ class ConfigModel(BaseModel):
     LLM_USE_PROXY: bool = True
     # LLM Base URL 预设标识，用于区分同一 Base URL 下的不同模型目录
     LLM_BASE_URL_PRESET: Optional[str] = None
-    # LLM最大上下文Token数量（K），用于目录缺失回退和未匹配兼容端点的保守上限
+    # LLM最大上下文Token数量（K），用于目录缺失回退和未匹配兼容端点的用户上限
     LLM_MAX_CONTEXT_TOKENS: int = 256
     # LLM OpenAI兼容接口请求User-Agent
     LLM_USER_AGENT: Optional[str] = None
@@ -1406,19 +1421,19 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
             try:
                 parts = token_pair.split(":")
                 if len(parts) != 2:
-                    print(f"无效的令牌格式: {token_pair}")
+                    print("无效的仓库 GitHub Token 配置格式")
                     continue
                 repo_info = parts[0].strip()
                 token = parts[1].strip()
                 if not repo_info or not token:
-                    print(f"无效的令牌或仓库信息: {token_pair}")
+                    print("仓库 GitHub Token 配置缺少仓库名或 Token")
                     continue
                 headers[repo_info] = {
                     "Authorization": f"Bearer {token}",
                     "User-Agent": self.NORMAL_USER_AGENT,
                 }
-            except Exception as e:
-                print(f"处理令牌对 '{token_pair}' 时出错: {e}")
+            except Exception:
+                print("解析仓库 GitHub Token 配置失败")
         # 如果传入了指定的仓库名称，则返回该仓库的请求头信息，否则返回默认请求头
         return headers.get(repo, self.GITHUB_HEADERS)
 

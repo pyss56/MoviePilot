@@ -1,6 +1,7 @@
 import asyncio
 import mimetypes
 from typing import Annotated, Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import aiofiles
 from anyio import Path as AsyncPath
@@ -38,7 +39,7 @@ from app.application.configuration import get_api_runtime_config_snapshot, get_c
 from app.application.plugin.catalog import get_plugin_catalog_query
 from app.application.plugin.config import PluginConfigCommand
 from app.application.plugin.data import PluginDataQueryService, PluginDataSummaryService
-from app.application.plugin.folders import add_clone_to_plugin_folder, remove_plugin_from_folders
+from app.application.plugin.folders import remove_plugin_from_folders
 from app.application.plugin.gateway import get_plugin_install_service
 from app.application.plugin.management import (
     get_plugin_snapshot,
@@ -57,7 +58,6 @@ from app.runtime.tasks import TaskRegistry
 from app.schemas.common import JsonObject as _SchemaJsonObject
 from app.schemas.exception import PluginMutationRejectedError
 from app.schemas.plugin import Plugin as _SchemaPlugin
-from app.schemas.plugin import PluginCloneRequest as _SchemaPluginCloneRequest
 from app.schemas.plugin import PluginDashboard as _SchemaPluginDashboard
 from app.schemas.plugin import PluginDashboardMetaItem as _SchemaPluginDashboardMetaItem
 from app.schemas.plugin import PluginDataSummary as _SchemaPluginDataSummary
@@ -156,7 +156,7 @@ def _is_plugin_auth_remote_file(plugin_id: str, filepath: str) -> bool:
         remote = provider.get("remote") or {}
         if str(remote.get("id") or "").lower() != normalized_plugin_id:
             continue
-        remote_path = str(remote.get("url") or "").lstrip("/")
+        remote_path = urlsplit(str(remote.get("url") or "")).path.lstrip("/")
         remote_path_lower = remote_path.lower()
         expected_prefix = f"plugin/file/{normalized_plugin_id}/"
         if not remote_path_lower.startswith(expected_prefix):
@@ -248,8 +248,10 @@ async def runtime_status(
         _SchemaPluginRuntimeStatus.READY,
     }
     failed = {
+        _SchemaPluginRuntimeStatus.SYNC_FAILED,
         _SchemaPluginRuntimeStatus.BLOCKED_BY_POLICY,
         _SchemaPluginRuntimeStatus.LOAD_FAILED,
+        _SchemaPluginRuntimeStatus.INCOMPATIBLE_RUNTIME,
     }
     return _SchemaPluginRuntimeSummary(
         ready=not plugin_manager.is_plugin_settling(),
@@ -257,6 +259,11 @@ async def runtime_status(
         pending_count=sum(status in pending for status in statuses.values()),
         failed_count=sum(status in failed for status in statuses.values()),
         restart_required_plugin_ids=sorted(restart_requirements),
+        gil_enabled_plugin_ids=[
+            plugin_id
+            for plugin_id in plugin_manager.get_plugin_gil_fallbacks()
+            if plugin_id.lower() in installed_plugin_ids
+        ],
     )
 
 
@@ -393,14 +400,14 @@ def reload_plugin(plugin_id: str, _: ApiPrincipal = Depends(get_current_active_s
         return _SchemaResponse(success=False, message=str(error))
     if runtime_status is _SchemaPluginRuntimeStatus.ACTIVE:
         return _SchemaResponse(success=True)
-    return _SchemaResponse(
-        success=False,
-        message=(
-            "未通过用户认证，请查看日志"
-            if runtime_status is _SchemaPluginRuntimeStatus.BLOCKED_BY_POLICY
-            else "插件加载失败，请查看插件日志"
-        ),
-    )
+    if runtime_status is _SchemaPluginRuntimeStatus.BLOCKED_BY_POLICY:
+        message = "未通过用户认证，请查看日志"
+    elif runtime_status is _SchemaPluginRuntimeStatus.INCOMPATIBLE_RUNTIME:
+        # 与插件卡片保持同一说法：重载不会改变载荷自身的运行时声明
+        message = "插件声明不支持当前运行环境，请查看日志"
+    else:
+        message = "插件加载失败，请查看插件日志"
+    return _SchemaResponse(success=False, message=message)
 
 
 @router.get(
@@ -756,7 +763,10 @@ async def plugin_static_file(
         return StreamingResponse(
             file_generator(),
             media_type=response_type,
-            headers={"Content-Disposition": f"inline; filename={plugin_file_path.name}"},
+            headers={
+                "Content-Disposition": f"inline; filename={plugin_file_path.name}",
+                "Cache-Control": "no-cache, must-revalidate",
+            },
         )
     except Exception as e:
         logger.error(
@@ -764,39 +774,6 @@ async def plugin_static_file(
             exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Internal Server Error")
-
-
-@router.post("/clone/{plugin_id}", summary="创建插件分身", response_model=_SchemaResponse[None])
-def clone_plugin(
-    plugin_id: str,
-    clone_data: _SchemaPluginCloneRequest,
-    _: ApiPrincipal = Depends(get_current_active_superuser),
-) -> Any:
-    """
-    创建插件分身
-    """
-    plugin_manager = get_plugin_manager()
-    try:
-        with plugin_manager.mutation(f"创建插件 {plugin_id} 分身"):
-            success, message = plugin_manager.clone_plugin(
-                plugin_id=plugin_id,
-                suffix=clone_data.suffix,
-                name=clone_data.name,
-                description=clone_data.description,
-                version=clone_data.version,
-                icon=clone_data.icon,
-            )
-
-            if success:
-                # 分身服务已完成运行态加载，此处只补齐宿主注册。
-                register_plugin(message)
-                # 将分身插件添加到原插件所在的文件夹中
-                add_clone_to_plugin_folder(plugin_id, message)
-                return _SchemaResponse(success=True, message="插件分身创建成功")
-            return _SchemaResponse(success=False, message=message)
-    except Exception as e:
-        logger.error(f"创建插件分身失败：{str(e)}")
-        return _SchemaResponse(success=False, message=f"创建插件分身失败：{str(e)}")
 
 
 @router.get(  # type: ignore[misc]
@@ -964,7 +941,11 @@ def uninstall_plugin(plugin_id: str, _: ApiPrincipal = Depends(get_current_activ
                 plugin_manager.delete_plugin_config(plugin_id, force=True)
                 plugin_manager.delete_plugin_data(plugin_id, force=True)
                 plugin_manager.delete_plugin_instance(plugin_id)
-            elif getattr(plugin_class, "is_clone", False):
+            else:
+                # 本体的装载判据在实例表的启用位上：不停用这一行，卸载后重启仍会
+                # 按已删除的包去加载它。业务参数保留，重装后用户的配置应当还在
+                plugin_manager.disable_plugin_host(plugin_id)
+            if not virtual_instance and getattr(plugin_class, "is_clone", False):
                 plugin_manager.delete_plugin_config(plugin_id, force=True)
                 plugin_manager.delete_plugin_data(plugin_id, force=True)
                 # 分身物理目录只能由包文件 owner 删除。

@@ -10,6 +10,7 @@ if os.name == "nt":
     if psql_exe:
         getattr(os, "add_dll_directory")(os.path.dirname(psql_exe))
 
+
 def _prepare_direct_execution_import_path() -> None:
     """
     修正直接执行 ``app/main.py`` 时的模块搜索路径。
@@ -203,6 +204,8 @@ def run_application() -> None:
     )
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
+    from app.runtime.gc import configure_allocator_background_thread
+    configure_allocator_background_thread()
 
     start_tray()
     run_api_server()

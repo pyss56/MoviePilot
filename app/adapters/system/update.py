@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -18,7 +19,7 @@ from typing import Any, cast
 
 from app.adapters.network.http import RequestUtils
 from app.adapters.system.resource import ResourceHelper, get_resource_versions
-from app.foundation.environment import is_docker
+from app.foundation.environment import is_docker, is_exe
 from app.foundation.singleton import SingletonClass
 from app.foundation.version import compare_version
 from app.runtime.dependencies.profile import runtime_sync_arguments
@@ -64,7 +65,8 @@ class SystemUpdateManager(metaclass=SingletonClass):
         "https://github.com/jxxghp/MoviePilot/archive/refs/tags/{tag}.zip"
     )
     _VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:[-.](?:alpha|beta|rc)\d*)?$", re.I)
-    _STABLE_VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+$", re.I)
+    # 稳定版允许 -N 后缀，用于不升小版本的临时修复（如 v3.0.10-1）
+    _STABLE_VERSION_PATTERN = re.compile(r"^v3\.\d+\.\d+(?:-\d+)?$", re.I)
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -235,12 +237,14 @@ class SystemUpdateManager(metaclass=SingletonClass):
         return next(item for item in state["updates"] if item["type"] == target)
 
     def _sync_aggregate(self, state: dict[str, Any]) -> dict[str, Any]:
-        """从两类明细重新计算旧版顶层字段和汇总进度。"""
+        """从两类明细重新计算旧版顶层字段、当前版本和汇总进度。"""
         application = self._get_item(state, _APPLICATION)
+        current_version = get_app_version()
+        application["current_version"] = current_version
         state.update(
             {
                 "state": application.get("state", "idle"),
-                "current_version": get_app_version(),
+                "current_version": current_version,
                 "version": application.get("version"),
                 "frontend_version": application.get("frontend_version"),
                 "release_name": application.get("release_name"),
@@ -314,16 +318,13 @@ class SystemUpdateManager(metaclass=SingletonClass):
                         }
                     )
                     changed = True
-                elif item.get("state") == "installing" and self._is_install_applied(item, target):
-                    self._reset_item_after_install(item)
-                    changed = True
                 elif (
-                    target == _RESOURCES
-                    and item.get("state") == "ready"
+                    item.get("state") in {"installing", "ready"}
                     and self._is_install_applied(item, target)
                 ):
-                    # 容器替换或手工安装可能先让运行资源达到目标版本，需丢弃残留待安装包。
-                    self._discard_prepared_target(target)
+                    if item.get("state") == "ready":
+                        # 容器替换或手工安装可能先让运行版本达到目标，需丢弃残留待安装包。
+                        self._discard_prepared_target(target)
                     self._reset_item_after_install(item)
                     changed = True
             resources_changed = (
@@ -341,7 +342,10 @@ class SystemUpdateManager(metaclass=SingletonClass):
     def _is_install_applied(self, item: dict[str, Any], target: SystemUpdateType) -> bool:
         """判断启动器应用后的当前版本是否已经达到安装目标。"""
         if target == _APPLICATION:
-            return bool(item.get("version")) and item["version"] == get_app_version()
+            target_version = str(item.get("version") or "")
+            return bool(target_version) and compare_version(
+                get_app_version(), ">=", target_version
+            ) is True
         current_auth, current_indexer = get_resource_versions()
         checks = []
         if item.get("auth_version"):
@@ -559,7 +563,8 @@ class SystemUpdateManager(metaclass=SingletonClass):
             try:
                 prepared = self._read_prepared_manifest()
                 if target == _APPLICATION:
-                    self._validate_application_manifest(prepared)
+                    if not is_exe():
+                        self._validate_application_manifest(prepared)
                     message = "主程序更新包已就绪，正在重启安装"
                 else:
                     self._validate_resource_manifest(prepared)
@@ -751,7 +756,7 @@ class SystemUpdateManager(metaclass=SingletonClass):
         return str(value or os.getenv(key, default) or default).strip()
 
     def _sync_docker_dependencies(self, project_dir: Path, *, force: bool = False) -> bool:
-        """按新后端清单同步 Docker 共享虚拟环境依赖。"""
+        """按新后端清单同步依赖，自定义包源时冻结锁文件避免重新求解。"""
         current_dir = self._docker_app_dir
         if not force and all(
             (current_dir / name).read_bytes() == (project_dir / name).read_bytes()
@@ -761,12 +766,13 @@ class SystemUpdateManager(metaclass=SingletonClass):
 
         venv_path = self._setting_text("VENV_PATH", "/opt/venv")
         uv_bin = self._setting_text("UV_BIN", "/usr/local/bin/uv")
+        package_index = self._setting_text("PIP_PROXY")
         command = [
             uv_bin,
             "sync",
             "--project",
             str(project_dir),
-            "--locked",
+            "--frozen" if package_index else "--locked",
             "--inexact",
             "--no-dev",
             "--no-install-project",
@@ -774,7 +780,6 @@ class SystemUpdateManager(metaclass=SingletonClass):
             f"{venv_path}/bin/python3",
             *runtime_sync_arguments(),
         ]
-        package_index = self._setting_text("PIP_PROXY")
         if package_index:
             command.extend(("--default-index", package_index))
         environment = os.environ.copy()
@@ -852,6 +857,28 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 follow_symlinks=False,
             )
 
+    def _copy_plugin_runtime_payload(self, source: Path, destination: Path) -> None:
+        """
+        迁移插件运行时内容，但保留新版宿主的包根入口。
+
+        ``app/plugins/__init__.py`` 属于后端源码提供的兼容入口，不属于持久化插件；
+        旧版本该文件包含宿主实现，随插件目录迁移会遮蔽新版 SDK 的兼容符号。
+        """
+        destination.mkdir(parents=True, exist_ok=True)
+        for destination_path in destination.iterdir():
+            if destination_path.name != "__init__.py":
+                self._remove_path(destination_path)
+
+        for source_path in source.iterdir():
+            if source_path.name == "__init__.py":
+                continue
+            destination_path = destination / source_path.name
+            if source_path.is_dir() and not source_path.is_symlink():
+                shutil.copytree(source_path, destination_path, symlinks=True)
+            else:
+                shutil.copy2(source_path, destination_path, follow_symlinks=False)
+            self._preserve_tree_ownership(source_path, destination_path)
+
     @staticmethod
     def _clear_staged_native_resources(resource_dir: Path) -> None:
         """清除暂存目录中的旧平台原生站点资源。"""
@@ -877,6 +904,28 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 resource_dir = legacy_dir
         return resource_dir
 
+    @staticmethod
+    def _is_site_runtime_resource(path: Path) -> bool:
+        """判断文件是否属于需要跨 Docker 应用升级继承的站点运行时资源。"""
+        return path.is_file() and (
+            (path.name.startswith("user.sites.") and path.suffix == ".bin")
+            or (
+                path.name.startswith("sites.")
+                and path.suffix in {".so", ".pyd", ".dylib"}
+            )
+        )
+
+    def _copy_site_runtime_resources(
+        self, source_dir: Path, destination_dir: Path
+    ) -> None:
+        """只把旧版本的站点索引和原生资源叠加到新版源码目录。"""
+        if not source_dir.is_dir():
+            return
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for path in source_dir.iterdir():
+            if self._is_site_runtime_resource(path):
+                shutil.copy2(path, destination_dir / path.name)
+
     def _copy_prepared_resources(
         self, prepared: dict[str, Any], resource_dir: Path
     ) -> None:
@@ -895,7 +944,12 @@ class SystemUpdateManager(metaclass=SingletonClass):
         *,
         include_resources: bool,
     ) -> tuple[Path, Path]:
-        """解压并组装待切换的 Docker 后端、前端和插件资源载荷。"""
+        """
+        解压并组装待切换的 Docker 后端、前端和插件资源载荷。
+
+        新版本归档是 Python 源码的唯一来源，旧版本目录只迁移插件和站点运行时内容，
+        不覆盖新版的插件包根兼容入口或新增应用模块。
+        """
         backend_extract = temporary_root / "backend"
         frontend_extract = temporary_root / "frontend"
         backend_extract.mkdir()
@@ -914,24 +968,19 @@ class SystemUpdateManager(metaclass=SingletonClass):
         current_app = self._docker_app_dir
         current_plugins = current_app / "app" / "plugins"
         stage_plugins = stage_app / "app" / "plugins"
-        if stage_plugins.exists() or stage_plugins.is_symlink():
+        if stage_plugins.is_symlink():
             self._remove_path(stage_plugins)
+        if stage_plugins.exists() and not stage_plugins.is_dir():
+            raise RuntimeError("插件运行目录不是目录")
+        stage_plugins.mkdir(parents=True, exist_ok=True)
         if current_plugins.is_dir():
-            shutil.copytree(current_plugins, stage_plugins, symlinks=True)
-            self._preserve_tree_ownership(current_plugins, stage_plugins)
-        else:
-            stage_plugins.mkdir(parents=True, exist_ok=True)
+            self._copy_plugin_runtime_payload(current_plugins, stage_plugins)
         if not (stage_plugins / "__init__.py").is_file():
             raise RuntimeError("插件运行目录缺少 app.plugins 兼容入口")
 
         stage_resources = stage_app / "app" / "application" / "site"
-        if stage_resources.exists() or stage_resources.is_symlink():
-            self._remove_path(stage_resources)
         current_resources = self._resource_source_dir(current_app)
-        if current_resources.is_dir():
-            shutil.copytree(current_resources, stage_resources, symlinks=True)
-        else:
-            stage_resources.mkdir(parents=True, exist_ok=True)
+        self._copy_site_runtime_resources(current_resources, stage_resources)
         if include_resources:
             self._copy_prepared_resources(prepared, stage_resources)
         return stage_app, stage_public
@@ -948,10 +997,33 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 self._remove_path(current)
             previous.replace(current)
 
+    def _backup_docker_current(
+        self, current: Path, previous: Path, temporary_root: Path
+    ) -> None:
+        """
+        将 Docker 当前目录移入回滚备份，并兼容 OverlayFS 的目录重命名限制。
+
+        OverlayFS 的镜像层目录可能无法直接 ``rename`` 到 upper 层。此时先完整复制
+        到更新事务的临时目录，复制成功后再把临时备份提升为正式回滚目录，避免将未
+        完成的备份交给回滚逻辑。
+        """
+        try:
+            current.replace(previous)
+            return
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+
+        temporary_previous = temporary_root / f"{current.name}.__update_previous__"
+        shutil.copytree(current, temporary_previous, symlinks=True)
+        self._preserve_tree_ownership(current, temporary_previous)
+        temporary_previous.replace(previous)
+        self._remove_path(current)
+
     def _apply_docker_application(
         self, prepared: dict[str, Any], *, include_resources: bool
     ) -> None:
-        """原子替换 Docker 后端源码和前端静态目录，并同步依赖。"""
+        """Docker 事务替换后端源码和前端静态目录，并同步依赖。"""
         app_dir = self._docker_app_dir
         public_dir = self._docker_public_dir
         previous_app = self._docker_previous_app_dir
@@ -980,9 +1052,11 @@ class SystemUpdateManager(metaclass=SingletonClass):
                     dependency_sync_started = True
                     self._sync_docker_dependencies(stage_app)
                 self._set_docker_pending("prepared")
-                app_dir.replace(previous_app)
+                self._backup_docker_current(app_dir, previous_app, temporary_root)
                 try:
-                    public_dir.replace(previous_public)
+                    self._backup_docker_current(
+                        public_dir, previous_public, temporary_root
+                    )
                     stage_app.replace(app_dir)
                     stage_public.replace(public_dir)
                 except OSError:
@@ -1075,7 +1149,10 @@ class SystemUpdateManager(metaclass=SingletonClass):
         """在后台线程中下载并校验指定升级类型的制品。"""
         try:
             if target == _APPLICATION:
-                self._download_application()
+                if is_exe():
+                    self._simulate_application_download()
+                else:
+                    self._download_application()
             else:
                 self._download_resources()
         except Exception as error:  # noqa: BLE001  后台线程必须沉淀为可查询失败
@@ -1085,6 +1162,35 @@ class SystemUpdateManager(metaclass=SingletonClass):
             with self._lock:
                 self._download_active = False
                 self._active_target = None
+
+    def _simulate_application_download(self) -> None:
+        """exe 部署下模拟主程序下载，直接写入准备清单并反馈完成。"""
+        if get_runtime_setting("MOVIEPILOT_AUTO_UPDATE") is not True:
+            raise RuntimeError("请先在高级设置里启用自动检查版本更新")
+        target_item = self._get_item(self._read_state(), _APPLICATION)
+        version = str(target_item.get("version") or "")
+        if not version:
+            raise RuntimeError("主程序更新缺少目标版本")
+        self._merge_prepared_manifest(
+            {
+                "version": version,
+                "frontend_version": version,
+                "backend_archive": str(self._backend_archive),
+                "frontend_archive": str(self._frontend_archive),
+                "backend_sha256": "",
+                "frontend_sha256": "",
+                "prepared_at": self._now(),
+            },
+        )
+        self._write_item(
+            _APPLICATION,
+            state="ready",
+            downloaded_bytes=100,
+            total_bytes=100,
+            error=None,
+            can_update=False,
+            can_install=True,
+        )
 
     def _download_application(self) -> None:
         """下载后端 Release 和其 version.py 声明的前端 dist.zip。"""
@@ -1315,20 +1421,27 @@ class SystemUpdateManager(metaclass=SingletonClass):
                 raise RuntimeError(f"站点资源文件校验失败：{item.get('name')}")
 
     def _request(self) -> RequestUtils:
-        """创建访问 GitHub Release 的请求客户端。"""
+        """创建访问 GitHub Release API 的认证请求客户端。"""
         return RequestUtils(
             proxies=get_runtime_setting("PROXY"),
             headers=get_runtime_setting("GITHUB_HEADERS"),
             timeout=60,
         )
 
+    def _download_request(self) -> RequestUtils:
+        """创建公开 GitHub 归档下载客户端，避免认证头传递到 codeload。"""
+        return RequestUtils(
+            proxies=get_runtime_setting("PROXY"),
+            timeout=60,
+        )
+
     def _download_file(
         self, url: str, destination: Path, downloaded_before: int, total_hint: int
     ) -> tuple[int, int]:
-        """流式下载文件并把进度写入当前升级类型。"""
+        """使用公开下载客户端流式下载文件并把进度写入当前升级类型。"""
         temporary = destination.with_suffix(".part")
         temporary.unlink(missing_ok=True)
-        with self._request().get_stream(url) as response:
+        with self._download_request().get_stream(url) as response:
             if response is None or response.status_code != 200:
                 raise RuntimeError(
                     f"下载更新包失败：HTTP {getattr(response, 'status_code', '无响应')}"

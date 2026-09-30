@@ -2,17 +2,17 @@
 
 import re
 import uuid
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from app.application.audio import capture_audio_metadata
 from app.application.classification.reference import (
     category_path_below_media_type,
 )
 from app.application.configuration import get_configured_system_config
 from app.application.directory import DirectoryHelper
 from app.application.formatting import FormatParser
-from app.application.history import (
+from app.application.history.retry import (
     describe_history_gate,
     evaluate_history_gate,
     is_skip_action,
@@ -28,7 +28,7 @@ from app.chain.storage import StorageChain
 from app.chain.transfer.contract import _TransferOwnerBase
 from app.domain.context import MediaInfo, MusicAlbumInfo, MusicInfo, TorrentInfo
 from app.domain.meta.metabase import MetaBase
-from app.domain.meta.metamusic import MetaMusic
+from app.domain.music import music_package_error
 from app.runtime.log import logger
 from app.runtime.progress import ProgressHelper
 from app.runtime.stop import runtime_stop_state
@@ -320,7 +320,9 @@ class TransferWorkflowOwner(_TransferOwnerBase):
             if batch_mtype == MediaType.MUSIC:
                 if self._is_music_lyrics_file(item):
                     return not self._is_blocked_by_exclude_words(item.path, exclude_words)
-                if not self._is_media_file(item, batch_mtype):
+                if not self._is_media_file(item, batch_mtype) and not (
+                    item.type == "file" and music_package_error(item.path or "")
+                ):
                     return False
                 if not self._is_allow_filesize(item, min_filesize):
                     return False
@@ -419,6 +421,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         """兼容旧内部钩子，统一委托请求工作流 owner。"""
         return self._run_transfer_workflow(*args, **kwargs)
 
+    @capture_audio_metadata()
     def _run_transfer_workflow(
         self,
         fileitem: FileItem,
@@ -597,8 +600,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
             ) = self._build_transfer_tasks(
                 file_items=file_items,
                 inherited_meta_map=inherited_meta_map,
-                build_file_meta=candidate_planner._build_file_meta,
-                meta=meta,
+                candidate_planner=candidate_planner,
                 mediainfo=mediainfo,
                 media_source=media_source,
                 media_id=media_id,
@@ -665,8 +667,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
         *,
         file_items: List[Tuple[FileItem, bool]],
         inherited_meta_map: Dict[Tuple[str, str], MetaBase],
-        build_file_meta: Callable[[Path, Optional[List[str]]], Optional[MetaBase]],
-        meta: Optional[MetaBase],
+        candidate_planner: _TransferCandidatePlanner,
         mediainfo: Optional[Union[MediaInfo, MusicInfo]],
         media_source: Optional[MediaSource],
         media_id: Optional[str],
@@ -705,6 +706,7 @@ class TransferWorkflowOwner(_TransferOwnerBase):
             batch_mtype == MediaType.MUSIC
             and sum(self._is_audio_file(item) for item, _ in file_items) > 1
         )
+        music_batch_context = self._prepare_music_batch_context(file_items, batch_mtype)
         try:
             for file_item, bluray_dir in file_items:
                 if runtime_stop_state.is_system_stopped:
@@ -712,8 +714,15 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                 if continue_callback and not continue_callback():
                     raise OperationInterrupted()
                 file_path = Path(file_item.path)
+                package_error = music_package_error(file_path.name) if batch_mtype == MediaType.MUSIC else None
+                if package_error:
+                    message = f"{file_path.name}：{package_error}"
+                    submission.record(file_item, "failed", message)
+                    all_success = False
+                    err_msgs.append(message)
+                    continue
 
-                # 自动整理按 app/application/history.py 的统一判定去重（失败记录放行重试、
+                # 自动整理按 app/application/history/ 的统一判定去重（失败记录放行重试、
                 # 成功但源文件已变化放行交 overwrite_mode 决断）；手动整理可清理失败记录，
                 # 或按用户确认清理成功记录；手动显式指定媒体身份时，先解除旧失败任务再重新规划。
                 if (
@@ -797,34 +806,19 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                     bluray_dir=bluray_dir,
                     download_hash=download_hash,
                 )
-
                 discard_music_identity = _should_discard_batch_music_identity(
+                    batch_mtype=batch_mtype,
                     multi_track_music_batch=multi_track_music_batch, manual=manual,
                     media_source=media_source,
                     media_id=media_id,
                     mediainfo=mediainfo,
                     history_music_type=self._download_history_music_type(download_history),
                 )
-                history_music_meta, history_music_info = self._restore_music_download_context(
-                    download_history=download_history,
-                    file_path=file_path,
-                    discard_saved_identity=discard_music_identity,
+                file_meta, history_music_info = candidate_planner._build_file_context(
+                    file_item, download_history,
+                    inherited_meta_map.get(self._get_file_key(file_item)),
+                    discard_music_identity,
                 )
-
-                if not meta:
-                    # 文件元数据(优先使用订阅识别词)
-                    inherited_meta = inherited_meta_map.get(self._get_file_key(file_item))
-                    if history_music_meta:
-                        file_meta = history_music_meta
-                    elif inherited_meta:
-                        file_meta = deepcopy(inherited_meta)
-                    else:
-                        file_meta = build_file_meta(
-                            file_path,
-                            self._get_subscribe_custom_words(download_history),
-                        )
-                else:
-                    file_meta = build_file_meta(file_path, None)
 
                 if not file_meta:
                     submission.record(file_item, "failed", f"{file_path.name} 无法识别有效信息")
@@ -842,18 +836,18 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                     _download_hash = download_hash
 
                 # 自动整理预载的媒体信息来自整条下载历史；电影合集内文件年份冲突时逐文件识别。
-                file_meta, task_mediainfo = self._selected_music_task_context(
-                    file_item, file_path, file_meta, selected_music_track_map,
-                    None if discard_music_identity
-                    else mediainfo or history_music_info,
+                file_meta, task_mediainfo = self._resolve_music_batch_file_context(
+                    batch_context=music_batch_context,
+                    file_item=file_item,
+                    file_path=file_path,
+                    file_meta=file_meta,
+                    selected_tracks=selected_music_track_map,
+                    fallback=None if discard_music_identity else mediainfo or history_music_info,
+                    discard_shared_identity=discard_music_identity,
+                    multi_track_batch=multi_track_music_batch,
+                    release_regions=music_release_regions,
+                    release_scripts=music_release_scripts,
                 )
-                if not task_mediainfo and isinstance(file_meta, MetaMusic):
-                    # 无标签音频或误带单曲身份的整包按目录级专辑匹配；命中结果带缓存不会逐文件重复请求
-                    file_meta, task_mediainfo = self._match_music_album_context(
-                        file_item, file_path, file_meta, music_release_regions, music_release_scripts,
-                    )
-                    if not task_mediainfo and discard_music_identity:
-                        task_mediainfo = self._music_info_from_meta(file_meta)
                 if not manual and task_mediainfo and self._is_movie_year_conflict(file_meta, task_mediainfo):
                     task_mediainfo = None
 
@@ -881,10 +875,8 @@ class TransferWorkflowOwner(_TransferOwnerBase):
                 )
                 cleanup_intent = cleanup_dest_fileitem if not preview and not cleanup_intent_assigned else None
                 transfer_task.bind_planning_input(
-                    self._TransferChain__build_planning_input(
-                        transfer_task,
-                        cleanup_dest_fileitem=cleanup_intent,
-                    )
+                    self._build_music_planning_input(transfer_task, music_batch_context, cleanup_intent,
+                                                    music_release_regions, music_release_scripts)
                 )
                 if (
                     recovery_admission

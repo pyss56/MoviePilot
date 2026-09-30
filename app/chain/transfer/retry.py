@@ -11,6 +11,7 @@ from app.application.history import (
 from app.application.transfer.execution import (
     TransferExecutionCommand,
     TransferExecutionRepository,
+    TransferExecutionState,
 )
 from app.chain._contracts import TransferMixinHost
 from app.chain.media import MediaChain
@@ -54,8 +55,10 @@ def _request_durable_transfer_retry(
             error,
         )
         return False, "整理任务暂时无法重试，请稍后重试"
+    if result.accepted and result.state is TransferExecutionState.NOT_STARTED:
+        MediaChain.clear_music_album_cache()
+        MediaChain().run_module("music_cache_clear")
     return result.accepted, result.message
-
 
 
 class FailedRetryMixin(_TransferOwnerBase):
@@ -306,7 +309,7 @@ class FailedRetryMixin(_TransferOwnerBase):
                         username=username,
                         title="智能助手整理完成",
                         text=final_output.strip()
-                             or f"整理记录 #{history_id} 已由智能助手处理完成。",
+                        or f"整理记录 #{history_id} 已由智能助手处理完成。",
                         link=self.runtime_config.history_url,
                         save_history=False,
                     )

@@ -2,6 +2,7 @@ import io
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Protocol
 
@@ -15,6 +16,8 @@ from app.runtime.log import logger
 
 WallpaperProvider = Callable[[], Optional[str]]
 WallpaperListProvider = Callable[[int], List[str]]
+_IMAGE_CACHE_PATH_PREFIX = "proxy_"
+_IMAGE_CACHE_HASH_LENGTH = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,7 +185,14 @@ def reset_wallpaper_providers() -> None:
 class WallpaperHelper(metaclass=Singleton):
     """
     壁纸帮助类
+
+    壁纸缓存键不区分来源，启动装配与生命周期撤销时需要清空；每个方法只缓存一条地址，
+    因此固定使用进程内缓存（local_only），清空不触及 Redis，也不跨进程沿用旧来源的结果。
     """
+
+    def clear_cache(self) -> None:
+        """清除全部壁纸来源缓存，使壁纸配置变更即时生效。"""
+        _clear_wallpaper_caches()
 
     def get_wallpaper(self) -> Optional[str]:
         """
@@ -227,21 +237,21 @@ class WallpaperHelper(metaclass=Singleton):
         wallpaper = self.get_static_wallpaper()
         return [wallpaper] if wallpaper else []
 
-    @cached(maxsize=1, ttl=3600)
+    @cached(maxsize=1, ttl=3600, local_only=True)
     def get_tmdb_wallpaper(self) -> Optional[str]:
         """
         获取TMDB每日壁纸
         """
         return _tmdb_wallpaper_provider()
 
-    @cached(maxsize=1, ttl=3600, skip_empty=True)
+    @cached(maxsize=1, ttl=3600, skip_empty=True, local_only=True)
     def get_tmdb_wallpapers(self, num: int = 10) -> List[str]:
         """
         获取7天的TMDB每日壁纸
         """
         return _tmdb_wallpaper_list_provider(num)
 
-    @cached(maxsize=1, ttl=3600)
+    @cached(maxsize=1, ttl=3600, local_only=True)
     def get_bing_wallpaper(self) -> Optional[str]:
         """
         获取Bing每日壁纸
@@ -259,7 +269,7 @@ class WallpaperHelper(metaclass=Singleton):
                 print(str(err))
         return None
 
-    @cached(maxsize=1, ttl=3600, skip_empty=True)
+    @cached(maxsize=1, ttl=3600, skip_empty=True, local_only=True)
     def get_bing_wallpapers(self, num: int = 7) -> List[str]:
         """
         获取7天的Bing每日壁纸
@@ -276,21 +286,21 @@ class WallpaperHelper(metaclass=Singleton):
                 print(str(err))
         return []
 
-    @cached(maxsize=1, ttl=3600)
+    @cached(maxsize=1, ttl=3600, local_only=True)
     def get_mediaserver_wallpaper(self) -> Optional[str]:
         """
         获取媒体服务器壁纸
         """
         return _mediaserver_wallpaper_provider()
 
-    @cached(maxsize=1, ttl=3600, skip_empty=True)
+    @cached(maxsize=1, ttl=3600, skip_empty=True, local_only=True)
     def get_mediaserver_wallpapers(self, num: int = 10) -> List[str]:
         """
         获取媒体服务器壁纸列表
         """
         return _mediaserver_wallpaper_list_provider(num)
 
-    @cached(maxsize=1, ttl=3600)
+    @cached(maxsize=1, ttl=3600, local_only=True)
     def get_customize_wallpaper(self) -> Optional[str]:
         """
         获取自定义壁纸api壁纸
@@ -300,7 +310,7 @@ class WallpaperHelper(metaclass=Singleton):
             return wallpaper_list[0]
         return None
 
-    @cached(maxsize=1, ttl=3600, skip_empty=True)
+    @cached(maxsize=1, ttl=3600, skip_empty=True, local_only=True)
     def get_customize_wallpapers(self) -> List[str]:
         """
         获取自定义壁纸api壁纸
@@ -360,18 +370,34 @@ class ImageHelper(metaclass=Singleton):
     """统一管理同步和异步图片缓存。"""
 
     def __init__(self):
-        """按全局图片缓存天数初始化文件缓存。"""
+        """
+        按全局图片缓存天数初始化文件缓存。
+
+        图片缓存始终落在 ``CACHE_PATH/images``，即使启用了 Redis 缓存后端：图片是
+        大体积二进制载荷，写入 Redis 会占据其绝大部分内存并放大 RDB 重写量。
+        过期由启动清理任务按 ``GLOBAL_IMAGE_CACHE_DAYS`` 与文件修改时间回收；
+        升级前已写入 Redis 的 ``images`` 键不再读取，由其自身 TTL 自然过期。
+        """
         config = get_chain_runtime_config_snapshot()
         _base_path = config.cache_path
         _ttl = config.global_image_cache_days * 24 * 3600
-        self.file_cache = FileCache(base=_base_path, ttl=_ttl)
-        self.async_file_cache = AsyncFileCache(base=_base_path, ttl=_ttl)
+        self.file_cache = FileCache(base=_base_path, ttl=_ttl, local_only=True)
+        self.async_file_cache = AsyncFileCache(
+            base=_base_path, ttl=_ttl, local_only=True
+        )
 
     @staticmethod
     def _prepare_cache_path(url: str) -> str:
-        """缓存路径"""
-        sanitized_path = SecurityUtils.sanitize_url_path(url)
-        cache_path = Path(sanitized_path)
+        """
+        根据图片 URL 生成缓存路径。
+
+        根路径或其他无有效文件名的 URL 使用完整 URL 的短哈希兜底，避免
+        `Path.with_suffix()` 对空路径抛出异常，并保证不同 URL 不共用该缓存名。
+        """
+        cache_path = Path(SecurityUtils.sanitize_url_path(url))
+        if not cache_path.name:
+            hash_value = sha256(url.encode()).hexdigest()[:_IMAGE_CACHE_HASH_LENGTH]
+            cache_path = Path(f"{_IMAGE_CACHE_PATH_PREFIX}{hash_value}")
         if not cache_path.suffix:
             cache_path = cache_path.with_suffix(".jpg")
         return cache_path.as_posix()
@@ -461,11 +487,11 @@ class ImageHelper(metaclass=Singleton):
         return (response.content, mime_type) if mime_type else None
 
     def fetch_image(
-        self,
-        url: str,
-        proxy: Optional[bool] = None,
-        use_cache: bool = True,
-        cookies: Optional[str | dict] = None) -> Optional[bytes]:
+            self,
+            url: str,
+            proxy: Optional[bool] = None,
+            use_cache: bool = True,
+            cookies: Optional[str | dict] = None) -> Optional[bytes]:
         """
         获取图片（同步版本）
         """
@@ -514,11 +540,11 @@ class ImageHelper(metaclass=Singleton):
         return result
 
     async def async_fetch_image(
-        self,
-        url: str,
-        proxy: Optional[bool] = None,
-        use_cache: bool = True,
-        cookies: Optional[str | dict] = None) -> Optional[bytes]:
+            self,
+            url: str,
+            proxy: Optional[bool] = None,
+            use_cache: bool = True,
+            cookies: Optional[str | dict] = None) -> Optional[bytes]:
         """
         获取图片（异步版本）
         """

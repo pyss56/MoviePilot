@@ -13,7 +13,9 @@ from scripts.evaluation.scenarios import get_scenario
 _PAGINATION = frozenset({"page", "count"})
 _QUERY_FIELDS = {
     "subscription.list": _PAGINATION,
-    "subscription.find": frozenset({"media_source", "season", "title", "music_type"}),
+    "subscription.find": frozenset(
+        {"media_source", "season", "title", "music_type", "mtype", "year"}
+    ),
     "subscription.get": frozenset(),
     "subscription.add": frozenset(),
     "subscription.delete": frozenset(),
@@ -41,7 +43,7 @@ _TORRENT_FIELDS = frozenset({
 })
 _SUBSCRIPTION_FIELDS = frozenset({
     "audio_format", "audio_quality", "backdrop", "best_version", "best_version_full", "classification_policy_revision",
-    "classification_rule_id", "classification_source", "completed_episode", "current_audio_format", "current_bit_depth",
+    "classification_rule_id", "classification_source", "completed_episode", "completed_tracks", "current_audio_format", "current_bit_depth",
     "current_bitrate", "current_priority", "current_sample_rate", "custom_words", "date", "description", "downloader",
     "effect", "episode_group", "episode_priority", "exclude", "execution_status", "filter", "filter_groups", "id",
     "include", "keyword", "lack_episode", "last_search", "last_update", "media_category", "media_category_id", "media_id",

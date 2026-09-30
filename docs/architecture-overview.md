@@ -301,7 +301,9 @@ sequenceDiagram
 - **Scheduler 同名职责包**：旧 `app/scheduler.py` 单体已退役；`catalog.py` 负责作业目录和计划投影，
   `execution.py`、`bridge.py`、`progress.py` 分别负责执行、跨循环句柄和进度终态，`registry.py`
   唯一持有 generation、active generation、reservation 与 handle，`reconcile.py` 和 `lifecycle.py`
-  分别负责动态任务协调与启动/重载/关闭。
+  分别负责动态任务协调与启动/重载/关闭，`oncejob.py` 承接插件一次性任务：插件经
+  `app.sdk.scheduler.add_plugin_once_job` 在宿主调度器追加延迟单次执行，不再自建常驻
+  `BackgroundScheduler`；追加不重建周期服务，服务重建只丢弃已被重载替换实例登记的任务。
 - **Scheduler 显式装配**：`startup/initializers/scheduler.py` 构造业务 Chain 一次，将绑定 callable
   组成 frozen `SchedulerServices` 后注入 Scheduler；Scheduler 包内不再构造业务 Chain。
   `app.scheduler` 包根只惰性保留 `Scheduler`/`SchedulerChain` 旧 ABI，新插件经 `app.sdk.scheduler`
@@ -453,7 +455,7 @@ flowchart LR
 ```
 
 - Oper 只接收和返回持久化值；`MediaInfo` / `MetaBase` 与数据库行之间的转换属于业务逻辑，
-  归 `app/application/`（见 `application/subscription/write.py`、`application/history.py`）。
+  归 `app/application/`（见 `application/subscription/write.py`、`application/history/`）。
   订阅新增、查询、变更、删除、身份和搜索契约已经统一收口在 `application/subscription/`，
   不再保留主题包之外的第二个写入入口。
 - 规范写入口中的 Oper 只 stage mutation，不创建独立 Session、不提交；Application Command
@@ -667,7 +669,11 @@ flowchart TB
   `app/api/` 的宿主端点。插件若已经自行返回 `Response`、字典、列表或其它可序列化值，宿主不再二次包裹。
 - `app/runtime/extensions/plugin/manager.py` 是 canonical 管理器 owner，发现、加载、生命周期、
   目录、同步等实现共同归入 `app/runtime/extensions/plugin/`。旧插件仍从 `app.core.plugin` 或
-  `app.sdk.plugins` 进入，并由 Compat 精确路由到同一个 `PluginManager` 身份。
+  `app.sdk.plugins` 进入，并由 Compat 精确路由到同一个 `PluginManager` 身份；新入口是
+  `app.sdk.plugin.manager`。
+- `app/sdk/plugin/base.py` 是插件契约基类 `_PluginBase` 与 `PluginChain` 的 owner。
+  `app/plugins/` 只是插件安装命名空间，包根不再导出符号，`app.plugins._PluginBase` 与历史拼写
+  `app.plugins.PluginChian` 由 Compat 精确叠加承接。
 - 插件可参与 `run_module` 方法分发（同名方法优先响应）并注册事件处理器。
 
 ---
@@ -756,8 +762,8 @@ flowchart LR
 
 | 指标 | 当前值 |
 |---|---:|
-| Python 模块 | 1009 |
-| 内部导入边 | 8,571 |
+| Python 模块 | 1055 |
+| 内部导入边 | 8,990 |
 | 非平凡 SCC | 1（精确 containment 的 TMDB 移植包环） |
 | Application / Chain 具体 Adapter 直连 | 0 / 0 |
 | Direct egress | 53（债务已清零，53 条精确 containment） |
@@ -767,7 +773,7 @@ flowchart LR
 | Model/Oper 自动事务与自建 Session | 0 |
 | 组合根外 `SystemConfigOper()` | 0 |
 
-整理失败反馈由 `app.application.transfer.feedback` 集中投影；Agent 持久回执新增 Application 端口及 DB Model/Oper/Adapter 四个冷导入模块。当前 `app.startup.lifecycle` 为 546、`app.factory` 为 558、`app.main` 为 560。性能基线只同步模块数量，原有耗时预算、历史采样和生命周期资源约束保持有效。
+整理失败反馈由 `app.application.transfer.feedback` 集中投影；已整理下载的站点字幕复用 `app.chain.transfer` 自动整理队列；网络连通性检测按 `app.application.nettest` 归档，并覆盖 HTTP 与 WebSocket 探测。未启用智能助手的消息音乐交互由 `app.chain.music_interaction` 包中的解析展示与订阅协调模块处理；音乐标签准入与批次共识由 `app.chain.transfer.music` 负责；宿主依赖边现为 8,990，音乐交互包未新增 SCC，插件一次性任务 owner `app.scheduler.oncejob` 带来 1 个模块和 9 条依赖边。Agent 持久回执新增 Application 端口及 DB Model/Oper/Adapter 四个冷导入模块。缓存组合根只在启动时选用 Redis 缓存才导入 Redis 适配器，依赖 langchain_core 的对话记忆模型归属 `app.agent.memory`，文件缓存且未启用智能体的实例不再加载 redis 与 langchain_core。当前 `app.startup.lifecycle` 为 575、`app.factory` 为 587、`app.main` 为 589。音乐调用观察 `app.application.music.observation` 新增一个轻量模块，记录来源结果及请求预算；AcoustID及路径识别复用此上下文传递有界指纹候选，保留旧单ID模块合同。站点图片域名快照新增 `app.application.security.image`，各启动入口增加一个模块；性能基线只同步模块数量，原有耗时预算、历史采样和生命周期资源约束保持有效。
 
 架构专项验证分为两个 CI 投影：`Check event semantic policy` 先运行依赖、Adapter、出口和 Event
 语义门禁，`Check host architecture snapshot` 再执行快照测试及一次

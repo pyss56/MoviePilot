@@ -28,7 +28,9 @@ UV_BIN="${UV_BIN:-/usr/local/bin/uv}"
 CONFIG_DIR="${CONFIG_DIR:-/config}"
 APP_DIR=/app
 PUBLIC_DIR=/public
-UPDATE_PENDING_FILE="${CONFIG_DIR}/temp/__update_pending__"
+# Dev 更新只需要跨同一容器重启恢复；标记必须和 /app、/public 位于同一容器可写层，
+# 避免容器重建后 /config 遗留旧标记阻断新镜像启动。
+UPDATE_PENDING_FILE="${MOVIEPILOT_UPDATE_PENDING_FILE:-/var/lib/moviepilot/update/__update_pending__}"
 UPDATE_PREVIOUS_APP="${APP_DIR}.__update_previous__"
 UPDATE_PREVIOUS_PUBLIC="${PUBLIC_DIR}.__update_previous__"
 
@@ -323,17 +325,22 @@ function stage_runtime_payload() {
     [ -f "${stage_app}/uv.lock" ] || return 1
     [ -f "${TMP_PATH}/dist/index.html" ] || return 1
 
+    if [ -e "${stage_plugin_dir}" ] && [ ! -d "${stage_plugin_dir}" ]; then
+        ERROR "插件运行目录不是目录"
+        return 1
+    fi
+    mkdir -p "${stage_plugin_dir}" || return 1
+    # 新版后端归档提供宿主兼容入口；仅迁移旧目录中的插件内容，避免旧版入口覆盖它。
+    if ! find "${stage_plugin_dir}" -mindepth 1 -maxdepth 1 \
+        ! -name "__init__.py" -exec rm -rf -- {} \;; then
+        return 1
+    fi
     if [ -d "${APP_DIR}/app/plugins" ]; then
-        rm -rf "${stage_plugin_dir}" || return 1
-        mkdir -p "${stage_plugin_dir}" || return 1
-        if ! cp -a "${APP_DIR}/app/plugins/." "${stage_plugin_dir}/"; then
+        if ! find "${APP_DIR}/app/plugins" -mindepth 1 -maxdepth 1 \
+            ! -name "__init__.py" -exec cp -a {} "${stage_plugin_dir}/" \;; then
             return 1
         fi
-    else
-        mkdir -p "${stage_plugin_dir}" || return 1
     fi
-    # 保留 app.plugins 兼容入口；V1/V2 插件仍从这里导入 _PluginBase。
-    # 删除后 app.plugins 会退化为 namespace package，旧插件会在启动时全部导入失败。
     if [ ! -f "${stage_plugin_dir}/__init__.py" ]; then
         ERROR "插件运行目录缺少 app.plugins 兼容入口"
         return 1

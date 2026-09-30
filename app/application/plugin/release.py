@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from app.application.plugin.catalog import apply_declared_metadata_fallback
-from app.application.plugin.identity import PluginIdentity
+from app.application.plugin.identity import PluginIdentity, PluginPayloadSourceType
 from app.schemas.plugin import Plugin
 
 MarketPluginLoader = Callable[[str, str | None, bool], Awaitable[list[Plugin] | None]]
@@ -15,6 +15,7 @@ ReleaseCacheProbe = Callable[[str], Awaitable[bool]]
 ReleaseLoader = Callable[[str, str], Awaitable[list[dict[str, Any]]]]
 ReleaseRefresher = Callable[[str, str], Awaitable[object]]
 IdentityReader = Callable[[str], Awaitable[PluginIdentity | None]]
+SourcePluginIdResolver = Callable[[str], str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,7 @@ class PluginReleaseService:
     def __init__(
         self,
         *,
+        source_plugin_id: SourcePluginIdResolver,
         installed_plugins: Callable[[], Sequence[Plugin]],
         local_repo_plugins: Callable[[], Sequence[Plugin]],
         market_plugins: MarketPluginLoader,
@@ -44,8 +46,10 @@ class PluginReleaseService:
         has_release_cache: ReleaseCacheProbe,
         releases: ReleaseLoader,
         refresh_releases: ReleaseRefresher,
+        free_threaded: Callable[[], bool],
     ) -> None:
-        """保存运行态、来源身份和市场读取窄端口。"""
+        """保存源身份归一、运行态、来源身份和市场读取窄端口。"""
+        self._source_plugin_id = source_plugin_id
         self._installed_plugins = installed_plugins
         self._local_repo_plugins = local_repo_plugins
         self._market_plugins = market_plugins
@@ -56,9 +60,16 @@ class PluginReleaseService:
         self._has_release_cache = has_release_cache
         self._releases = releases
         self._refresh_releases = refresh_releases
+        self._free_threaded = free_threaded
 
     async def history(self, plugin_id: str, *, force: bool = True) -> Plugin | None:
-        """按可信绑定仓库读取单个已安装插件的更新说明。"""
+        """按可信绑定仓库读取单个已安装插件的更新说明。
+
+        先把分身归一到源插件：分身只是共享同一份源码的运行实例，安装清单、本地插件
+        仓与来源身份都只登记在源插件名下，拿分身自身 ID（源插件 ID 加后缀）去查会一路
+        落空，端点据此判定「插件不存在或未安装」并返回 404。
+        """
+        plugin_id = self._source_plugin_id(plugin_id)
         installed_plugin = next(
             (plugin for plugin in self._installed_plugins() if plugin.id == plugin_id),
             None,
@@ -71,22 +82,33 @@ class PluginReleaseService:
             installed_plugin = apply_declared_metadata_fallback(
                 [installed_plugin],
                 {identity.normalized_plugin_id: identity},
+                free_threaded=self._free_threaded(),
             )[0]
 
         local_plugin = next(
             (plugin for plugin in self._local_repo_plugins() if plugin.id == plugin_id),
             None,
         )
-        if local_plugin is not None:
-            return _merge_market_metadata(installed_plugin, local_plugin)
+        if identity is not None and identity.payload_source_type is PluginPayloadSourceType.LOCAL:
+            return (
+                _merge_market_metadata(installed_plugin, local_plugin)
+                if local_plugin is not None
+                else installed_plugin
+            )
 
         repo_url = _trusted_repo_url(identity)
-        if repo_url is None:
-            return installed_plugin
-        market_plugin = await self._market_plugin(plugin_id, repo_url, force)
+        if repo_url is not None:
+            market_plugin = await self._market_plugin(plugin_id, repo_url, force)
+            return (
+                _merge_market_metadata(installed_plugin, market_plugin)
+                if market_plugin is not None
+                else installed_plugin
+            )
+
+        # 尚未建立来源身份的本地插件继续使用本地仓库元数据，兼容首次迁移前的运行态。
         return (
-            _merge_market_metadata(installed_plugin, market_plugin)
-            if market_plugin is not None
+            _merge_market_metadata(installed_plugin, local_plugin)
+            if local_plugin is not None
             else installed_plugin
         )
 
@@ -97,7 +119,12 @@ class PluginReleaseService:
         *,
         force: bool = False,
     ) -> PluginReleaseSnapshot:
-        """读取 Release 快照，并标记是否需要后台强制刷新已有缓存。"""
+        """读取 Release 快照，并标记是否需要后台强制刷新已有缓存。
+
+        先把分身归一到源插件：Release 记录与本地版本号都按源插件登记，拿分身自身 ID
+        去查市场索引与本地版本会一并落空，界面上表现为该分身没有任何可选版本。
+        """
+        plugin_id = self._source_plugin_id(plugin_id)
         if not repo_url:
             return PluginReleaseSnapshot(False, None, None, ())
 
@@ -195,6 +222,11 @@ def _merge_market_metadata(plugin: Plugin, market_plugin: Plugin) -> Plugin:
                 "system_version_message": (
                     market_plugin.system_version_message
                     or plugin.system_version_message
+                ),
+                # 版本历史弹窗的"更新到最新版"同样按运行时兼容状态禁用并说明原因
+                "runtime_compatible": market_plugin.runtime_compatible,
+                "runtime_message": (
+                    market_plugin.runtime_message or plugin.runtime_message
                 ),
             }
         ),

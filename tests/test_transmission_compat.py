@@ -24,6 +24,7 @@ def _load_transmission_client_module():
         """
         测试日志桩，仅提供被客户端封装调用的方法。
         """
+
         def info(self, *_args, **_kwargs):
             """
             忽略信息日志。
@@ -99,11 +100,16 @@ def test_login_enables_incomplete_file_suffix_by_default():
     fake_client = MagicMock()
     fake_client.get_session.return_value = {"rename-partial-files": False}
 
-    with patch.object(transmission_module.transmission_rpc, "Client", return_value=fake_client):
+    with patch.object(
+        transmission_module.transmission_rpc,
+        "Client",
+        return_value=fake_client,
+    ) as client_cls:
         downloader = Transmission(host="127.0.0.1", port=9091)
 
     assert downloader.trc is fake_client
     fake_client.set_session.assert_called_once_with(rename_partial_files=True)
+    assert client_cls.call_args.kwargs["timeout"] == (3, 60)
 
 
 def test_login_disables_incomplete_file_suffix_when_configured():

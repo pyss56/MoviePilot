@@ -32,6 +32,99 @@ Music recognition, exploration, album and artist navigation, and recognition-cac
   rules. Album lookup uses the album credit without replacing the track's
   performer. Conflicting explicit recording dates are version mismatches;
   missing dates alone do not reject a candidate.
+- Preserve `MusicMeta.music_type` when metadata carries a bound identity. Read
+  `media_source`, `media_id`, and `music_type` together; an album ID is not a
+  recording ID. The optional `musicbrainz_release_id`,
+  `musicbrainz_release_group_id`, and `musicbrainz_release_track_id` refer to
+  distinct MusicBrainz entities and never replace the primary identity.
+- `MusicMeta.album_type` and `secondary_types` retain declared release types,
+  including EP, Single, and Compilation. These differ from the recording/album/
+  artist entity type; track count alone must not override a declared release type.
+- `original_year` and `release_year` distinguish the original and current
+  edition; `year` remains the display-compatible value. A release group's first
+  release date does not prove the current edition. Preserve `total_discs` and
+  `field_sources` in round trips. Sources such as `tag`, `album_tags`, `stream`,
+  `filename`, `directory`, `torrent`, `remote`, and `manual` explain field origins;
+  they do not independently prove that an online identity was verified.
+- CUE-derived fields use the `cue` evidence source. `music_layout=image_cue`
+  represents a whole album in one physical audio file; do not identify it as the
+  first Recording or assume it has been split. Organization keeps the audio and
+  companion `cue_filename` unchanged within the organized album directory.
+  `cue_tracks` stores logical tracks and 75-frames-per-second indexes. Split
+  `tracks_cue` metadata may supplement tracks, but the original multi-file CUE
+  is not copied after track renaming. Treat `organization_error` as a blocking
+  structural issue rather than overriding it with an unrelated media ID.
+- Writing music tags or embedded covers to a local hardlink/symlink uses an
+  independent copy and atomically replaces only the library entry after all
+  writes succeed. Seed bytes and permissions remain unchanged. A changed target
+  becomes a regular file and consumes independent disk space; unchanged tags
+  without other writes retain the link. Skip tags and covers to keep linked
+  audio. Failed writes or a concurrently changed target discard the temporary
+  copy. LRC and Lyricsfile sidecars also replace directory entries atomically.
+  Untagged files can be written, and incorrect extensions use the actual
+  container. Native ID3 and MP4/freeform writers keep recording/release/group/
+  release-track identities separate. An original year alone writes
+  the original-year tag (`ORIGINALDATE` or its native equivalent), never a
+  fabricated current-release date. Preserve more precise existing dates in the
+  same year. APEv2 MusicBrainz keys use underscores, not ID3's spaced descriptions.
+- Organization uses each file's `storage`: remote items use names and original
+  torrent evidence, never local tags, duration, or CUE at an identical path.
+  An `.m4a` suffix alone does not establish AAC/ALAC or lossless status.
+  Explicit music transfers reject disc images and archives with an extraction
+  message. Explicit movie/TV transfers do not inherit old music identities for
+  accompanying audio tracks.
+- Album track alignment requires unique identity, title, disc/track position,
+  or duration evidence; file order never fills unresolved tracks. Numeric file
+  names are weak evidence, while numeric titles in tags remain meaningful.
+  Manual album selection may correct names using unique positions, but still
+  rejects clear duration conflicts. An incomplete manual alignment stops before
+  file operations and asks the caller to check the selected edition and tracks.
+- A concrete `musicbrainz_release_id` uses direct release lookup; a release-group
+  ID constrains release search. Generic inbox directory names are not album
+  evidence. All local logical tracks must align, even for a partial download.
+  Conflicting identities, current edition years, and performer tags reject a
+  candidate. Near ties with different recording sequences remain unmatched;
+  equivalent editions in one release group retain region/script preferences.
+  Successful `raw_data.match_score` is a ranking score, not a probability, and
+  `match_coverage=1` covers the supplied files, not necessarily the full album.
+  CUE images contribute logical tracks/durations and keep an album identity;
+  changing the CUE invalidates the directory match cache.
+- Track-title discovery uses the Recording search index and its related
+  releases. Release search has no `recording` field. At similar relevance,
+  releases supported by multiple recordings precede editions of one single.
+- Native AcoustID recognition verifies at most five Recording candidates using
+  duration, meaningful titles, artists, and versions. A unique high-score match
+  with consistent duration can identify untagged or numbered files. Placeholder
+  artist tags are missing evidence, while explicit conflicting artists or live
+  versions still reject a candidate. Real numeric song tags remain meaningful;
+  zero-padded rip numbers and `Track 01` do not establish a trusted local title.
+  Near ties or truncated candidates remain `ambiguous`. A native fingerprint
+  result has `raw_data.recognition.method=fingerprint`,
+  `identity_type=recording`, and `release_verified=false`; supplemental release
+  IDs and `album_id` must come from actual tags, with `album_id` retaining only
+  a release-group ID. Legacy single-ID plugins keep their text-validation
+  contract and are not assigned an invented AcoustID score. Fingerprint work
+  shares a 90-second, 16-HTTP-attempt budget, or the existing enclosing budget.
+  Cached fingerprints retain candidates and expire after 3600 seconds for a
+  hit, 300 seconds for no match, and 15 seconds for a transient failure.
+- Recognition has an eight-attempt HTTP budget with 45 seconds for waits and
+  request timeouts. Cached HTTP results cost no request slots. Album-directory
+  success, no-match, and transient failures expire after 3600, 300, and 15
+  seconds respectively. Unidentified metadata expires within 300 seconds;
+  service errors and exhausted budgets are not stored as unidentified metadata.
+  `MusicInfo.raw_data.recognition` may carry `status`, `message`, `requests`, and
+  `candidates`. Ambiguity, conflicts, service errors, and exhausted budgets stop
+  organization before file operations. Clearing/deleting music cache also
+  invalidates HTTP responses and album directories. Audio/CUE evidence is reused
+  only within a bounded read-only scan and invalidated by file changes or scope
+  exit.
+- Transient recognition failures before a file plan exists stay durably accepted
+  and retry recognition after 30 seconds, within the existing transfer retry
+  budget. Recovery keeps the original release file selection and preferences.
+  Retrying a settled music planning rejection with no file/provider operations
+  may create a new recognition task; the old history and settlement receipt stay
+  available. Existing file-operation evidence always keeps its frozen plan.
+  A retry-wait response is pending work, never proof that files were organized.
 
 ## Operations
 

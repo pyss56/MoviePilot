@@ -8,6 +8,7 @@ CONFIG_DIR="${CONFIG_DIR:-/config}"
 export VENV_PATH CONFIG_DIR
 SUPERVISOR_CONFIG="/etc/supervisor/supervisord.conf"
 RESTART_REQUEST_FILE="${CONFIG_DIR}/temp/moviepilot.pending_supervisor_restart"
+INSTALL_MANIFEST="${CONFIG_DIR}/temp/moviepilot-update/install.json"
 
 function INFO() {
     echo "[INFO] ${1}"
@@ -17,11 +18,22 @@ function ERROR() {
     echo "[ERROR] ${1}" >&2
 }
 
+if [ ! -f "${INSTALL_MANIFEST}" ]; then
+    INFO "→ 未检测到待安装的更新清单，跳过 Docker 更新 worker。"
+    exit 0
+fi
+
 cd /app || exit 1
 
 INFO "→ 开始将已下载的更新包替换到 Docker 程序目录..."
 if ! "${VENV_PATH}/bin/python3" -m app.cli apply-prepared-update; then
     ERROR "→ Docker 更新包替换失败，保留当前运行进程。"
+    exit 1
+fi
+
+# /app 可能刚刚被替换，切回稳定目录后再调用 supervisor 控制面。
+if ! cd /; then
+    ERROR "→ 更新后无法切回稳定工作目录。"
     exit 1
 fi
 

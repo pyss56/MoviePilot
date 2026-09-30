@@ -7,8 +7,9 @@ import pytest
 from app.chain.message import MessageChain
 from app.chain.interaction import MediaInteractionChain
 from app.runtime.events import EventManager
-from app.domain.context import Context, MediaInfo, TorrentInfo
+from app.domain.context import Context, MediaInfo, MusicInfo, TorrentInfo
 from app.domain.meta.metabase import MetaBase
+from app.domain.meta.metamusic import MetaMusic
 from app.application.messaging.interaction import InteractionContext
 from app.application.messaging.media import media_interaction_manager
 from app.application.messaging.plugin import (
@@ -16,7 +17,14 @@ from app.application.messaging.plugin import (
     plugin_input_interaction_manager,
 )
 from app.schemas import IncomingMessage, TransferDirectoryConf  # pylint: disable=no-name-in-module
-from app.schemas.types import EventType, MediaSource, MediaType, NotificationChannel
+from app.schemas.types import (
+    MUSIC_ENTITY_ALBUM,
+    MUSIC_ENTITY_RECORDING,
+    EventType,
+    MediaSource,
+    MediaType,
+    NotificationChannel,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +51,258 @@ def _build_meta(name: str) -> MetaBase:
     meta.name = name
     meta.begin_season = 1
     return meta
+
+
+@pytest.mark.parametrize(
+    ("text", "action", "query"),
+    [
+        ("音乐 搜索 周杰伦 晴天", "MusicSearch", "周杰伦 晴天"),
+        ("搜歌 周杰伦 晴天", "MusicSearch", "周杰伦 晴天"),
+        ("下载音乐 周杰伦 晴天", "MusicReSearch", "周杰伦 晴天"),
+        ("订阅音乐 周杰伦 晴天", "MusicSubscribe", "周杰伦 晴天"),
+        ("音乐 洗版 周杰伦 晴天", "MusicReSubscribe", "周杰伦 晴天"),
+    ],
+)
+def test_resolve_explicit_music_message_actions(text, action, query):
+    """显式音乐前缀应路由到相应音乐操作并保留检索词。"""
+    assert MediaInteractionChain._resolve_action(text) == (action, query)
+
+
+def test_message_routes_music_search_when_agent_is_disabled():
+    """未启用智能助手时，消息渠道音乐搜索应创建音乐候选交互。"""
+    chain = MessageChain()
+    chain.runtime_config = replace(chain.runtime_config, ai_agent_enable=False)
+    candidates = [
+        MusicInfo(
+            media_source=MediaSource.MusicBrainz,
+            media_id="recording-1",
+            title="晴天",
+            artists=["周杰伦"],
+        ),
+        MusicInfo(
+            media_source=MediaSource.MusicBrainz,
+            media_id="album-1",
+            music_type=MUSIC_ENTITY_ALBUM,
+            title="叶惠美",
+            artists=["周杰伦"],
+        ),
+    ]
+
+    with (
+        patch(
+            "app.chain.interaction.MediaChain.search_music",
+            return_value=candidates,
+        ) as search_music,
+        patch(
+            "app.chain.interaction.MediaInteractionChain._render_interaction"
+        ),
+    ):
+        chain._handle_message_core(
+            channel=NotificationChannel.Wechat,
+            source="wechat-test",
+            userid="music-user",
+            username="tester",
+            text="音乐 搜索 周杰伦 晴天",
+        )
+
+    search_music.assert_called_once_with(
+        query="周杰伦 晴天",
+        limit=20,
+        music_types=(MUSIC_ENTITY_RECORDING, MUSIC_ENTITY_ALBUM),
+    )
+    request = media_interaction_manager.get_by_user("music-user")
+    assert request is not None
+    assert request.action == "MusicSearch"
+    assert request.keyword == "周杰伦 晴天"
+    assert request.items == candidates
+
+
+def test_music_candidates_are_presented_as_text_for_plain_message_channel():
+    """不支持媒体卡片的消息渠道应以编号文本展示单曲和专辑候选。"""
+    chain = MediaInteractionChain()
+    request = media_interaction_manager.create_or_replace(
+        user_id="music-user",
+        channel=NotificationChannel.Wechat,
+        source="wechat-test",
+        username="tester",
+        action="MusicSearch",
+        keyword="周杰伦 晴天",
+        title="周杰伦 晴天",
+        meta=MetaMusic.parse_query("周杰伦 晴天"),
+        items=[
+            MusicInfo(title="晴天", artists=["周杰伦"]),
+            MusicInfo(
+                music_type=MUSIC_ENTITY_ALBUM,
+                title="叶惠美",
+                artists=["周杰伦"],
+            ),
+        ],
+    )
+
+    with patch.object(chain, "post_message") as post_message:
+        chain._post_medias_message(
+            request=request,
+            channel=NotificationChannel.Wechat,
+            source="wechat-test",
+            userid="music-user",
+        )
+
+    notification = post_message.call_args.args[0]
+    assert "请回复对应数字选择" in notification.title
+    assert notification.buttons is None
+    assert notification.parse_mode == ""
+    assert "1. [单曲] 晴天 — 周杰伦" in notification.text
+    assert "2. [专辑] 叶惠美 — 周杰伦" in notification.text
+
+
+@pytest.mark.parametrize("channel", [NotificationChannel.Wechat, NotificationChannel.Telegram])
+def test_music_torrents_show_original_titles_and_keep_selection(channel):
+    """音乐资源选择显示原始音乐标题，并保留当前渠道的序号或按钮操作。"""
+    chain = MediaInteractionChain()
+    album = MusicInfo(
+        media_source=MediaSource.MusicBrainz,
+        media_id="album-1",
+        music_type=MUSIC_ENTITY_ALBUM,
+        title="叶惠美",
+        artists=["周杰伦"],
+    )
+    request = media_interaction_manager.create_or_replace(
+        user_id="music-user",
+        channel=channel,
+        source="music-test",
+        username="tester",
+        action="MusicReSearch",
+        keyword="周杰伦 叶惠美",
+        title="叶惠美",
+        meta=MetaMusic.parse_query("周杰伦 叶惠美"),
+        items=[],
+    )
+    request.current_media = album
+    request.phase = "torrent"
+    request.items = [
+        Context(
+            media_info=album,
+            meta_info=MetaMusic.parse_resource("周杰伦 - 叶惠美 FLAC 24bit 96kHz"),
+            torrent_info=TorrentInfo(
+                title="周杰伦 - 叶惠美 FLAC 24bit 96kHz",
+                site_name="TestSite",
+                size=1024,
+                seeders=10,
+            ),
+        )
+    ]
+
+    with (
+        patch.object(chain, "post_message") as post_message,
+        patch.object(chain, "post_torrents_message") as post_torrents_message,
+    ):
+        chain._post_torrents_message(
+            request=request,
+            channel=channel,
+            source="music-test",
+            userid="music-user",
+        )
+
+    notification = post_message.call_args.args[0]
+    assert "1.【TestSite】周杰伦 - 叶惠美 FLAC 24bit 96kHz" in notification.text
+    assert notification.parse_mode == ""
+    assert notification.link == chain.runtime_config.resource_url
+    assert "0: 自动选择" in notification.title or notification.buttons
+    if notification.buttons:
+        assert any(
+            button["callback_data"].endswith(":download:1")
+            for row in notification.buttons for button in row
+        )
+    post_torrents_message.assert_not_called()
+
+
+def test_music_subscription_selection_preserves_selected_music_type():
+    """选择音乐专辑创建订阅时应将实体类型传给订阅链。"""
+    chain = MediaInteractionChain()
+    album = MusicInfo(
+        media_source=MediaSource.MusicBrainz,
+        media_id="album-1",
+        music_type=MUSIC_ENTITY_ALBUM,
+        title="叶惠美",
+        artists=["周杰伦"],
+    )
+    request = media_interaction_manager.create_or_replace(
+        user_id="music-user",
+        channel=NotificationChannel.Wechat,
+        source="wechat-test",
+        username="tester",
+        action="MusicSubscribe",
+        keyword="周杰伦 叶惠美",
+        title="叶惠美",
+        meta=MetaMusic.parse_query("周杰伦 叶惠美"),
+        items=[album],
+    )
+
+    with (
+        patch(
+            "app.chain.interaction.DownloadChain.get_no_exists_info",
+            return_value=(False, None),
+        ),
+        patch("app.chain.interaction.SubscribeChain.add") as add_subscribe,
+        patch.object(chain.user_repository, "find_name_by_bindings", return_value=None),
+    ):
+        chain.handle_text_interaction(
+            channel=NotificationChannel.Wechat,
+            source="wechat-test",
+            userid="music-user",
+            username="tester",
+            text="1",
+        )
+
+    assert request.current_media is album
+    assert add_subscribe.call_args.kwargs["music_type"] == MUSIC_ENTITY_ALBUM
+
+
+def test_auto_download_fallback_subscription_preserves_music_type():
+    """音乐自动下载未完成时补建订阅应保留单曲或专辑实体类型。"""
+    chain = MediaInteractionChain()
+    album = MusicInfo(
+        media_source=MediaSource.MusicBrainz,
+        media_id="album-1",
+        music_type=MUSIC_ENTITY_ALBUM,
+        title="叶惠美",
+        artists=["周杰伦"],
+    )
+    request = media_interaction_manager.create_or_replace(
+        user_id="music-user",
+        channel=NotificationChannel.Wechat,
+        source="wechat-test",
+        username="tester",
+        action="MusicSearch",
+        keyword="周杰伦 叶惠美",
+        title="叶惠美",
+        meta=MetaMusic.parse_query("周杰伦 叶惠美"),
+        items=[album],
+    )
+    request.current_media = album
+
+    with (
+        patch(
+            "app.chain.interaction.DownloadChain.get_no_exists_info",
+            return_value=(False, None),
+        ),
+        patch(
+            "app.chain.interaction.DownloadChain.batch_download",
+            return_value=([], [object()]),
+        ),
+        patch("app.chain.interaction.SubscribeChain.add") as add_subscribe,
+        patch.object(chain.user_repository, "find_name_by_bindings", return_value=None),
+    ):
+        chain._auto_download(
+            request=request,
+            cache_list=[],
+            channel=NotificationChannel.Wechat,
+            source="wechat-test",
+            userid="music-user",
+            username="tester",
+        )
+
+    assert add_subscribe.call_args.kwargs["music_type"] == MUSIC_ENTITY_ALBUM
 
 
 def _build_context(title: str = "星际穿越") -> Context:
@@ -186,10 +446,14 @@ def test_message_routes_text_reply_to_media_interaction_before_ai():
     )
     assert request is not None
 
-    with patch.object(chain, "_record_user_message"), patch(
-        "app.chain.interaction.MediaInteractionChain.handle_text_interaction",
-        return_value=True,
-    ) as handle_text, patch.object(chain, "_handle_ai_message") as handle_ai:
+    with (
+        patch.object(chain, "_record_user_message"),
+        patch(
+            "app.chain.interaction.MediaInteractionChain.handle_text_interaction",
+            return_value=True,
+        ) as handle_text,
+        patch.object(chain, "_handle_ai_message") as handle_ai,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Wechat,
             source="wechat-test",
@@ -216,9 +480,10 @@ def test_message_process_preserves_parser_message_id_context():
         reply_to_message_id=99,
     )
 
-    with patch.object(chain, "message_parser", return_value=incoming), patch.object(
-        chain, "handle_message"
-    ) as handle_message:
+    with (
+        patch.object(chain, "message_parser", return_value=incoming),
+        patch.object(chain, "handle_message") as handle_message,
+    ):
         chain.process(body=None, form=None, args={"source": "telegram-test"})
 
     handle_message.assert_called_once()
@@ -242,9 +507,10 @@ def test_message_process_keeps_callback_message_id_as_edit_context():
         chat_id="chat-a",
     )
 
-    with patch.object(chain, "message_parser", return_value=incoming), patch.object(
-        chain, "handle_message"
-    ) as handle_message:
+    with (
+        patch.object(chain, "message_parser", return_value=incoming),
+        patch.object(chain, "handle_message") as handle_message,
+    ):
         chain.process(body=None, form=None, args={"source": "telegram-test"})
 
     handle_message.assert_called_once()
@@ -266,9 +532,10 @@ def test_message_process_preserves_non_telegram_plain_message_id():
         chat_id="slack-channel",
     )
 
-    with patch.object(chain, "message_parser", return_value=incoming), patch.object(
-        chain, "handle_message"
-    ) as handle_message:
+    with (
+        patch.object(chain, "message_parser", return_value=incoming),
+        patch.object(chain, "handle_message") as handle_message,
+    ):
         chain.process(body=None, form=None, args={"source": "slack-test"})
 
     handle_message.assert_called_once()
@@ -282,14 +549,15 @@ def test_handle_message_keeps_legacy_positional_images_argument():
     chain = MessageChain()
     images = [IncomingMessage.MessageImage(ref="tg://file_id/photo-1")]
 
-    with patch(
-        "app.chain.message.PluginInputInteractionHandler.handle_text",
-        return_value=False,
-    ), patch.object(
-        chain, "_mark_message_processing_started", return_value=None
-    ), patch.object(
-        chain, "_mark_message_processing_finished"
-    ), patch.object(chain, "_handle_message_core", return_value=False) as handle_core:
+    with (
+        patch(
+            "app.chain.message.PluginInputInteractionHandler.handle_text",
+            return_value=False,
+        ),
+        patch.object(chain, "_mark_message_processing_started", return_value=None),
+        patch.object(chain, "_mark_message_processing_finished"),
+        patch.object(chain, "_handle_message_core", return_value=False) as handle_core,
+    ):
         chain.handle_message(
             NotificationChannel.Telegram,
             "telegram-test",
@@ -331,10 +599,14 @@ def test_plugin_input_session_captures_plain_text_before_media_interaction():
         items=[MediaInfo(title="星际穿越", year="2014")],
     )
 
-    with patch.object(chain, "_record_user_message"), patch(
-        "app.chain.interaction.MediaInteractionChain.handle_text_interaction",
-        return_value=True,
-    ) as handle_media, patch.object(chain.eventmanager, "send_event") as send_event:
+    with (
+        patch.object(chain, "_record_user_message"),
+        patch(
+            "app.chain.interaction.MediaInteractionChain.handle_text_interaction",
+            return_value=True,
+        ) as handle_media,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Wechat,
             source="wechat-test",
@@ -376,9 +648,7 @@ def test_plugin_input_session_does_not_record_sensitive_text_history():
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ):
+    with patch.object(chain, "_record_user_message") as record_message, patch.object(chain.eventmanager, "send_event"):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -402,9 +672,7 @@ def test_plugin_input_session_captures_slash_like_text_before_commands():
         prompt_id="path",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -432,9 +700,11 @@ def test_plugin_input_session_cancel_notifies_plugin_and_clears():
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(chain, "post_message") as post_message:
+    with (
+        patch.object(chain, "_record_user_message"),
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "post_message") as post_message,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -463,9 +733,11 @@ def test_plugin_input_cancel_does_not_block_next_command():
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(chain, "post_message"):
+    with (
+        patch.object(chain, "_record_user_message"),
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "post_message"),
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -498,9 +770,7 @@ def test_plugin_input_session_ignores_non_text_messages():
     )
     image = IncomingMessage.MessageImage(ref="https://example.invalid/image.jpg")
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -510,13 +780,10 @@ def test_plugin_input_session_ignores_non_text_messages():
             images=[image],
         )
 
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test") == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
 
 def test_plugin_input_session_ignores_none_text_messages():
@@ -546,9 +813,9 @@ def test_plugin_input_session_ignores_none_text_messages():
     )
 
     assert handled is False
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == request
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test") == request
+    )
 
 
 def test_plugin_input_session_is_bound_to_user_and_channel():
@@ -562,9 +829,9 @@ def test_plugin_input_session_is_bound_to_user_and_channel():
     )
 
     assert plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Wechat) is None
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == request
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test") == request
+    )
     assert plugin_input_interaction_manager.get_by_user("10002", NotificationChannel.Telegram) is None
 
 
@@ -579,9 +846,7 @@ def test_plugin_input_session_does_not_capture_other_channel_text():
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Wechat,
             source="wechat-test",
@@ -590,13 +855,10 @@ def test_plugin_input_session_does_not_capture_other_channel_text():
             text="普通搜索",
         )
 
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test") == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
 
 def test_plugin_input_session_does_not_capture_other_source_text():
@@ -610,9 +872,7 @@ def test_plugin_input_session_does_not_capture_other_source_text():
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-bot-b",
@@ -621,13 +881,10 @@ def test_plugin_input_session_does_not_capture_other_source_text():
             text="普通搜索",
         )
 
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-bot-a"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-bot-a") == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
 
 def test_plugin_input_session_does_not_capture_other_chat_text():
@@ -642,9 +899,7 @@ def test_plugin_input_session_does_not_capture_other_chat_text():
         chat_id="chat-a",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -654,17 +909,13 @@ def test_plugin_input_session_does_not_capture_other_chat_text():
             original_chat_id="chat-b",
         )
 
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -695,9 +946,10 @@ def test_plugin_input_prompt_message_requires_matching_reply():
         payload={"step": "keyword"},
     )
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -709,17 +961,16 @@ def test_plugin_input_prompt_message_requires_matching_reply():
         )
 
     record_message.assert_called_once()
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -737,9 +988,10 @@ def test_plugin_input_prompt_message_requires_matching_reply():
     assert payload["input_session_id"] == request.request_id
     assert payload["input_text"] == "当前回复框文本"
     assert payload["reply_to_message_id"] == "prompt-current"
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) is None
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        is None
+    )
 
 
 def test_plugin_input_prompt_message_matches_integer_reply_ids():
@@ -788,9 +1040,10 @@ def test_plugin_input_prompt_message_ignores_plain_text_without_reply():
         payload={"step": "keyword"},
     )
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -801,13 +1054,11 @@ def test_plugin_input_prompt_message_ignores_plain_text_without_reply():
         )
 
     record_message.assert_called_once()
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
 
 def test_plugin_input_prompt_message_allows_direct_cancel_without_reply():
@@ -824,9 +1075,11 @@ def test_plugin_input_prompt_message_allows_direct_cancel_without_reply():
         payload={"step": "keyword"},
     )
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(chain, "post_message") as post_message:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "post_message") as post_message,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -843,9 +1096,10 @@ def test_plugin_input_prompt_message_allows_direct_cancel_without_reply():
     assert payload["input_session_id"] == request.request_id
     assert payload["cancelled"] is True
     post_message.assert_called_once()
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) is None
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        is None
+    )
 
 
 def test_expired_prompt_message_cancel_text_falls_back_to_normal_search_without_notice():
@@ -862,11 +1116,11 @@ def test_expired_prompt_message_cancel_text_falls_back_to_normal_search_without_
         timeout_seconds=60,
     ).created_at = datetime.now() - timedelta(seconds=61)
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(
-        chain, "_handle_message_core", return_value=False
-    ) as handle_core:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "_handle_message_core", return_value=False) as handle_core,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -879,13 +1133,11 @@ def test_expired_prompt_message_cancel_text_falls_back_to_normal_search_without_
 
     record_message.assert_called_once()
     handle_core.assert_called_once()
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        is None
     )
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) is None
 
 
 def test_plugin_input_prompt_message_requires_matching_chat_id():
@@ -902,9 +1154,10 @@ def test_plugin_input_prompt_message_requires_matching_chat_id():
         payload={"step": "keyword"},
     )
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -916,13 +1169,11 @@ def test_plugin_input_prompt_message_requires_matching_chat_id():
         )
 
     record_message.assert_called_once()
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
 
 def test_expired_prompt_message_input_falls_back_to_normal_search_without_notice():
@@ -940,9 +1191,11 @@ def test_expired_prompt_message_input_falls_back_to_normal_search_without_notice
     )
     request.created_at = datetime.now() - timedelta(seconds=61)
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(chain, "post_message") as post_message:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "post_message") as post_message,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -955,13 +1208,11 @@ def test_expired_prompt_message_input_falls_back_to_normal_search_without_notice
 
     record_message.assert_called_once()
     post_message.assert_not_called()
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        is None
     )
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) is None
 
 
 def test_expired_prompt_message_without_reply_falls_back_and_clears_state():
@@ -979,9 +1230,10 @@ def test_expired_prompt_message_without_reply_falls_back_and_clears_state():
     )
     request.created_at = datetime.now() - timedelta(seconds=61)
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -992,13 +1244,11 @@ def test_expired_prompt_message_without_reply_falls_back_and_clears_state():
         )
 
     record_message.assert_called_once()
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        is None
     )
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) is None
 
 
 def test_plugin_input_chatless_session_keeps_legacy_chat_fallback():
@@ -1012,9 +1262,7 @@ def test_plugin_input_chatless_session_keeps_legacy_chat_fallback():
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1041,9 +1289,10 @@ def test_plugin_input_wildcard_session_does_not_match_missing_source_with_chat()
         username="tester",
     )
 
-    assert plugin_input_interaction_manager.consume_by_user(
-        "10001", NotificationChannel.Telegram, None, "chat-a"
-    ) == (None, None)
+    assert plugin_input_interaction_manager.consume_by_user("10001", NotificationChannel.Telegram, None, "chat-a") == (
+        None,
+        None,
+    )
     assert plugin_input_interaction_manager.get_by_user("10001", None, None) == request
 
 
@@ -1058,12 +1307,14 @@ def test_plugin_input_chat_bound_session_does_not_match_missing_chat():
         chat_id="chat-a",
     )
 
-    assert plugin_input_interaction_manager.consume_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == (None, None)
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) == request
+    assert plugin_input_interaction_manager.consume_by_user("10001", NotificationChannel.Telegram, "telegram-test") == (
+        None,
+        None,
+    )
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        == request
+    )
 
 
 def test_plugin_input_core_path_preserves_original_chat_id():
@@ -1107,9 +1358,7 @@ def test_plugin_input_session_does_not_capture_missing_source_text():
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source=None,
@@ -1118,13 +1367,10 @@ def test_plugin_input_session_does_not_capture_missing_source_text():
             text="普通搜索",
         )
 
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-bot-a"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-bot-a") == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
 
 def test_plugin_input_session_does_not_capture_callback_payload():
@@ -1139,9 +1385,11 @@ def test_plugin_input_session_does_not_capture_callback_payload():
         chat_id="chat-a",
     )
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(chain, "_handle_callback", return_value=True) as handle_callback:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "_handle_callback", return_value=True) as handle_callback,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1154,13 +1402,11 @@ def test_plugin_input_session_does_not_capture_callback_payload():
 
     record_message.assert_not_called()
     handle_callback.assert_called_once()
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        == request
     )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
 
 def test_plugin_input_session_expires_after_timeout():
@@ -1191,9 +1437,11 @@ def test_plugin_input_session_expired_text_notifies_plugin_and_continues_routing
     )
     request.created_at = datetime.now() - timedelta(seconds=121)
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(chain, "post_message") as post_message:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "post_message") as post_message,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1227,9 +1475,11 @@ def test_plugin_input_session_expired_sensitive_text_is_not_recorded_or_routed()
     )
     request.created_at = datetime.now() - timedelta(seconds=121)
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(chain, "post_message") as post_message:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "post_message") as post_message,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1270,9 +1520,11 @@ def test_plugin_input_expired_text_after_cleanup_is_not_recorded_or_routed():
     )
     assert request.request_id not in plugin_input_interaction_manager._by_id
 
-    with patch.object(chain, "_record_user_message") as record_message, patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event, patch.object(chain, "post_message") as post_message:
+    with (
+        patch.object(chain, "_record_user_message") as record_message,
+        patch.object(chain.eventmanager, "send_event") as send_event,
+        patch.object(chain, "post_message") as post_message,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1301,9 +1553,7 @@ def test_plugin_input_session_with_no_channel_matches_specific_channel():
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1330,9 +1580,7 @@ def test_plugin_input_session_with_no_channel_and_no_source_does_not_match_speci
         username="tester",
     )
 
-    with patch.object(chain, "_record_user_message"), patch.object(
-        chain.eventmanager, "send_event"
-    ) as send_event:
+    with patch.object(chain, "_record_user_message"), patch.object(chain.eventmanager, "send_event") as send_event:
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1342,10 +1590,7 @@ def test_plugin_input_session_with_no_channel_and_no_source_does_not_match_speci
         )
 
     assert plugin_input_interaction_manager.get_by_user("10001", None, None) == request
-    assert not any(
-        call.args and call.args[0] == EventType.MessageAction
-        for call in send_event.call_args_list
-    )
+    assert not any(call.args and call.args[0] == EventType.MessageAction for call in send_event.call_args_list)
 
 
 def test_plugin_input_create_or_replace_keeps_legacy_positional_timeout_and_payload():
@@ -1429,9 +1674,10 @@ def test_plugin_input_bypass_reply_check_still_requires_matching_chat_id():
 
     assert consumed is None
     assert status is None
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test", "chat-a"
-    ) == request
+    assert (
+        plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test", "chat-a")
+        == request
+    )
 
 
 def test_plugin_input_specific_session_replaces_overlapping_no_channel_session():
@@ -1451,12 +1697,11 @@ def test_plugin_input_specific_session_replaces_overlapping_no_channel_session()
         username="tester",
     )
 
-    assert plugin_input_interaction_manager.pop_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == new_request
-    assert plugin_input_interaction_manager.pop_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) is None
+    assert (
+        plugin_input_interaction_manager.pop_by_user("10001", NotificationChannel.Telegram, "telegram-test")
+        == new_request
+    )
+    assert plugin_input_interaction_manager.pop_by_user("10001", NotificationChannel.Telegram, "telegram-test") is None
 
 
 def test_plugin_input_session_pop_by_user_consumes_once():
@@ -1469,12 +1714,10 @@ def test_plugin_input_session_pop_by_user_consumes_once():
         username="tester",
     )
 
-    assert plugin_input_interaction_manager.pop_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == request
-    assert plugin_input_interaction_manager.pop_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) is None
+    assert (
+        plugin_input_interaction_manager.pop_by_user("10001", NotificationChannel.Telegram, "telegram-test") == request
+    )
+    assert plugin_input_interaction_manager.pop_by_user("10001", NotificationChannel.Telegram, "telegram-test") is None
 
 
 def test_plugin_input_session_pop_by_user_ignores_prompt_message_binding():
@@ -1488,12 +1731,10 @@ def test_plugin_input_session_pop_by_user_ignores_prompt_message_binding():
         prompt_message_id="prompt-current",
     )
 
-    assert plugin_input_interaction_manager.pop_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == request
-    assert plugin_input_interaction_manager.get_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) is None
+    assert (
+        plugin_input_interaction_manager.pop_by_user("10001", NotificationChannel.Telegram, "telegram-test") == request
+    )
+    assert plugin_input_interaction_manager.get_by_user("10001", NotificationChannel.Telegram, "telegram-test") is None
 
 
 def test_plugin_input_session_pop_by_user_removes_expired_prompt_session():
@@ -1509,12 +1750,10 @@ def test_plugin_input_session_pop_by_user_removes_expired_prompt_session():
     )
     request.created_at = datetime.now() - timedelta(seconds=61)
 
-    assert plugin_input_interaction_manager.pop_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) == request
-    assert plugin_input_interaction_manager.pop_by_user(
-        "10001", NotificationChannel.Telegram, "telegram-test"
-    ) is None
+    assert (
+        plugin_input_interaction_manager.pop_by_user("10001", NotificationChannel.Telegram, "telegram-test") == request
+    )
+    assert plugin_input_interaction_manager.pop_by_user("10001", NotificationChannel.Telegram, "telegram-test") is None
 
 
 def test_target_plugin_filter_only_allows_target_plugin_handler():
@@ -1535,16 +1774,10 @@ def test_target_plugin_filter_only_allows_target_plugin_handler():
     should_dispatch = EventManager._EventManager__should_dispatch_to_target_plugin
     handler_id = EventManager._EventManager__get_handler_identifier(demo_plugin_handler)
 
-    assert should_dispatch(
-        demo_plugin_handler, "tests.plugins.demo_plugin.handle", "demo_plugin"
-    ) is True
+    assert should_dispatch(demo_plugin_handler, "tests.plugins.demo_plugin.handle", "demo_plugin") is True
     assert should_dispatch(demo_plugin_handler, handler_id, "demo_plugin") is True
-    assert should_dispatch(
-        demo_plugin_handler, "tests.plugins.other_plugin.handle", "demo_plugin"
-    ) is False
-    assert should_dispatch(
-        other_plugin_handler, "tests.plugins.other_plugin.handle", "demo_plugin"
-    ) is False
+    assert should_dispatch(demo_plugin_handler, "tests.plugins.other_plugin.handle", "demo_plugin") is False
+    assert should_dispatch(other_plugin_handler, "tests.plugins.other_plugin.handle", "demo_plugin") is False
     assert should_dispatch(module_handler, "tests.module_handler", "demo_plugin") is False
 
 
@@ -1562,14 +1795,15 @@ def test_noai_prefix_starts_traditional_search_when_global_ai_enabled():
         MediaInfo(title="Interstellar", year="2014"),
     ]
 
-    with patch.object(chain, "_record_user_message"), patch(
-        "app.chain.media.MediaChain.search",
-        return_value=(meta, medias),
-    ) as search_media, patch(
-        "app.chain.interaction.MediaInteractionChain.post_medias_message"
-    ) as post_medias_message, patch.object(
-        chain, "_handle_ai_message"
-    ) as handle_ai:
+    with (
+        patch.object(chain, "_record_user_message"),
+        patch(
+            "app.chain.media.MediaChain.search",
+            return_value=(meta, medias),
+        ) as search_media,
+        patch("app.chain.interaction.MediaInteractionChain.post_medias_message") as post_medias_message,
+        patch.object(chain, "_handle_ai_message") as handle_ai,
+    ):
         chain.handle_message(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1630,10 +1864,13 @@ def test_media_interaction_starts_search_and_posts_media_list():
         MediaInfo(title="Interstellar", year="2014"),
     ]
 
-    with patch(
-        "app.chain.media.MediaChain.search",
-        return_value=(meta, medias),
-    ), patch.object(chain, "post_medias_message") as post_medias_message:
+    with (
+        patch(
+            "app.chain.media.MediaChain.search",
+            return_value=(meta, medias),
+        ),
+        patch.object(chain, "post_medias_message") as post_medias_message,
+    ):
         handled = chain.handle_text_interaction(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1667,10 +1904,7 @@ def test_media_interaction_legacy_page_callback_updates_existing_request():
         keyword="星际穿越",
         title="星际穿越",
         meta=_build_meta("星际穿越"),
-        items=[
-            MediaInfo(title=f"资源 {index}", year="2024")
-            for index in range(1, 11)
-        ],
+        items=[MediaInfo(title=f"资源 {index}", year="2024") for index in range(1, 11)],
     )
 
     with patch.object(chain, "post_medias_message") as post_medias_message:
@@ -1709,12 +1943,14 @@ def test_torrent_selection_prompts_download_dir_buttons_before_download():
     )
     request.phase = "torrent"
 
-    with patch(
+    with (
+        patch(
             "app.chain.interaction.DirectoryHelper.get_download_dirs",
-        return_value=_build_multiple_movie_download_dirs(),
-    ), patch.object(chain, "post_message") as post_message, patch(
-            "app.chain.interaction.DownloadChain.download_single"
-    ) as download_single:
+            return_value=_build_multiple_movie_download_dirs(),
+        ),
+        patch.object(chain, "post_message") as post_message,
+        patch("app.chain.interaction.DownloadChain.download_single") as download_single,
+    ):
         handled = chain.handle_text_interaction(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1754,13 +1990,17 @@ def test_torrent_selection_skips_download_dir_when_only_one_dir_matches_media():
     )
     request.phase = "torrent"
 
-    with patch(
+    with (
+        patch(
             "app.chain.interaction.DirectoryHelper.get_download_dirs",
-        return_value=_build_download_dirs(),
-    ), patch.object(chain, "post_message") as post_message, patch(
+            return_value=_build_download_dirs(),
+        ),
+        patch.object(chain, "post_message") as post_message,
+        patch(
             "app.chain.interaction.DownloadChain.download_single",
-        return_value="hash",
-    ) as download_single:
+            return_value="hash",
+        ) as download_single,
+    ):
         handled = chain.handle_text_interaction(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1794,13 +2034,17 @@ def test_torrent_selection_skips_download_dir_when_user_has_single_dir():
     )
     request.phase = "torrent"
 
-    with patch(
+    with (
+        patch(
             "app.chain.interaction.DirectoryHelper.get_download_dirs",
-        return_value=_build_single_download_dir(),
-    ), patch.object(chain, "post_message") as post_message, patch(
+            return_value=_build_single_download_dir(),
+        ),
+        patch.object(chain, "post_message") as post_message,
+        patch(
             "app.chain.interaction.DownloadChain.download_single",
-        return_value="hash",
-    ) as download_single:
+            return_value="hash",
+        ) as download_single,
+    ):
         handled = chain.handle_text_interaction(
             channel=NotificationChannel.Telegram,
             source="telegram-test",
@@ -1834,10 +2078,13 @@ def test_torrent_selection_prompts_text_download_dir_for_plain_channel():
     )
     request.phase = "torrent"
 
-    with patch(
+    with (
+        patch(
             "app.chain.interaction.DirectoryHelper.get_download_dirs",
-        return_value=_build_multiple_movie_download_dirs(),
-    ), patch.object(chain, "post_message") as post_message:
+            return_value=_build_multiple_movie_download_dirs(),
+        ),
+        patch.object(chain, "post_message") as post_message,
+    ):
         handled = chain.handle_text_interaction(
             channel=NotificationChannel.Wechat,
             source="wechat-test",
@@ -1876,13 +2123,16 @@ def test_download_dir_callback_runs_pending_single_download_without_save_path_fo
     request.pending_download_mode = "single"
     request.pending_download_context = context
 
-    with patch(
+    with (
+        patch(
             "app.chain.interaction.DirectoryHelper.get_download_dirs",
-        return_value=_build_multiple_movie_download_dirs(),
-    ), patch(
+            return_value=_build_multiple_movie_download_dirs(),
+        ),
+        patch(
             "app.chain.interaction.DownloadChain.download_single",
-        return_value="hash",
-    ) as download_single:
+            return_value="hash",
+        ) as download_single,
+    ):
         request.download_dirs = chain._get_download_dirs(context.media_info)
         handled = chain.handle_callback_interaction(
             callback_data=f"media:{request.request_id}:download-dir:1",
@@ -1918,13 +2168,16 @@ def test_download_dir_callback_runs_pending_single_download_with_save_path():
     request.pending_download_mode = "single"
     request.pending_download_context = context
 
-    with patch(
+    with (
+        patch(
             "app.chain.interaction.DirectoryHelper.get_download_dirs",
-        return_value=_build_multiple_movie_download_dirs(),
-    ), patch(
+            return_value=_build_multiple_movie_download_dirs(),
+        ),
+        patch(
             "app.chain.interaction.DownloadChain.download_single",
-        return_value="hash",
-    ) as download_single:
+            return_value="hash",
+        ) as download_single,
+    ):
         request.download_dirs = chain._get_download_dirs(context.media_info)
         handled = chain.handle_callback_interaction(
             callback_data=f"media:{request.request_id}:download-dir:2",
@@ -1960,13 +2213,16 @@ def test_download_dir_text_reply_runs_pending_single_download_without_save_path(
     request.pending_download_mode = "single"
     request.pending_download_context = context
 
-    with patch(
+    with (
+        patch(
             "app.chain.interaction.DirectoryHelper.get_download_dirs",
-        return_value=_build_multiple_movie_download_dirs(),
-    ), patch(
+            return_value=_build_multiple_movie_download_dirs(),
+        ),
+        patch(
             "app.chain.interaction.DownloadChain.download_single",
-        return_value="hash",
-    ) as download_single:
+            return_value="hash",
+        ) as download_single,
+    ):
         request.download_dirs = chain._get_download_dirs()
         handled = chain.handle_text_interaction(
             channel=NotificationChannel.Wechat,
@@ -1989,7 +2245,7 @@ def test_get_download_dirs_keeps_matching_tv_category_dir():
     context = _build_tv_context()
 
     with patch(
-            "app.chain.interaction.DirectoryHelper.get_download_dirs",
+        "app.chain.interaction.DirectoryHelper.get_download_dirs",
         return_value=_build_download_dirs(),
     ):
         download_dirs = chain._get_download_dirs(context.media_info)

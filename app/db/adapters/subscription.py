@@ -82,6 +82,7 @@ def _project_subscription(record: Subscribe) -> SubscriptionSnapshot:
         media_id=record.media_id,
         music_type=record.music_type,
         total_tracks=record.total_tracks,
+        downloaded_tracks=cast(Optional[builtins.list[str]], record.downloaded_tracks),
         season=record.season,
         poster=record.poster,
         backdrop=record.backdrop,
@@ -304,6 +305,21 @@ class TransactionalSubscriptionRepository(_TransactionalSubscriptionWriter):
         async with self._async_session() as session:
             return await operation(SubscribeOper(session))
 
+    async def _async_write(
+        self,
+        operation: Callable[[SubscribeOper], Awaitable[T]],
+    ) -> T:
+        """在独立异步 Session 中执行写入并提交事务。"""
+        async with self._async_session() as session:
+            unit_of_work = SqlAlchemyAsyncUnitOfWork(session)
+            try:
+                result = await operation(SubscribeOper(session))
+                await unit_of_work.commit()
+                return result
+            except Exception:
+                await unit_of_work.rollback()
+                raise
+
     def exists(self, identity: SubscriptionIdentity) -> bool:
         """同步判断媒体身份是否已有订阅。"""
         return bool(
@@ -362,6 +378,29 @@ class TransactionalSubscriptionRepository(_TransactionalSubscriptionWriter):
         """同步按可选状态读取订阅快照。"""
         return self._read(lambda repository: [_project_subscription(record) for record in repository.list(state)])
 
+    async def async_exists(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+        season: Optional[int] = None,
+        episode_group: Optional[str] = None,
+        music_type: Optional[str] = None,
+    ) -> Optional[SubscriptionSnapshot]:
+        """异步按媒体身份、季号及可选剧集组读取命中的订阅快照。"""
+
+        async def operation(repository: SubscribeOper) -> Optional[SubscriptionSnapshot]:
+            """在独立 Session 中执行 Servarr 查重并投影快照。"""
+            record = await repository.async_exists(
+                media_source=media_source,
+                media_id=media_id,
+                season=season,
+                episode_group=episode_group,
+                music_type=music_type,
+            )
+            return _project_subscription(record) if record is not None else None
+
+        return await self._async_read(operation)
+
     async def async_get(self, subscribe_id: int) -> Optional[SubscriptionSnapshot]:
         """异步按主键读取订阅快照。"""
 
@@ -372,6 +411,14 @@ class TransactionalSubscriptionRepository(_TransactionalSubscriptionWriter):
 
         return await self._async_read(operation)
 
+    async def async_delete(self, subscribe_id: int) -> None:
+        """在独立异步事务中删除订阅。"""
+
+        async def operation(repository: SubscribeOper) -> None:
+            """在当前独立 Session 中暂存订阅删除。"""
+            await repository.async_delete(subscribe_id)
+
+        await self._async_write(operation)
 
     async def async_list(
         self,
@@ -462,6 +509,7 @@ class TransactionalSubscriptionRepository(_TransactionalSubscriptionWriter):
             return [_project_subscription(record) for record in records]
 
         return await self._async_read(operation)
+
 
 class TransactionalSubscriptionHistoryRepository:
     """以独立短 AsyncSession 实现 Agent 等后台入口的订阅历史查询。"""
@@ -614,6 +662,28 @@ class SessionSubscriptionRepository:
         """异步按主键读取订阅快照。"""
         record = await self._async_repository().async_get(subscribe_id)
         return _project_subscription(record) if record is not None else None
+
+    async def async_exists(
+        self,
+        media_source: MediaSource,
+        media_id: str,
+        season: Optional[int] = None,
+        episode_group: Optional[str] = None,
+        music_type: Optional[str] = None,
+    ) -> Optional[SubscriptionSnapshot]:
+        """异步按媒体身份、季号及可选剧集组读取命中的订阅快照。"""
+        record = await self._async_repository().async_exists(
+            media_source=media_source,
+            media_id=media_id,
+            season=season,
+            episode_group=episode_group,
+            music_type=music_type,
+        )
+        return _project_subscription(record) if record is not None else None
+
+    async def async_delete(self, subscribe_id: int) -> None:
+        """在调用方异步事务中暂存订阅删除，不提交事务。"""
+        await self._async_repository().stage_delete(subscribe_id)
 
     async def async_list(
         self,
@@ -786,14 +856,19 @@ class SessionSubscriptionRepository:
         self,
         username: Optional[str],
         state: str,
+        mtype: Optional[str] = None,
     ) -> builtins.list[int]:
-        """异步读取用户或管理员全局范围内指定状态的订阅主键。"""
+        """异步读取用户或管理员指定媒体类型范围内的订阅主键。"""
         snapshots = (
-            await self.async_list_by_username(username, state)
+            await self.async_list_by_username(username, state, mtype=mtype)
             if username is not None
             else await self.async_list(state)
         )
-        return [snapshot.id for snapshot in snapshots]
+        return [
+            snapshot.id
+            for snapshot in snapshots
+            if snapshot.id and (mtype is None or snapshot.type == mtype)
+        ]
 
     async def stage_delete(self, subscribe_id: int) -> None:
         """异步暂存删除订阅。"""

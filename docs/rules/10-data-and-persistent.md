@@ -20,6 +20,7 @@ Models are SQLAlchemy declarative classes. Each model maps to one database table
 | `Message` | Message log |
 | `PluginData` | Plugin-persisted data |
 | `PluginIdentity` | Installed physical-plugin source binding and payload provenance |
+| `PluginInstance` | Per-instance plugin descriptor and configuration, one row per instance |
 | `PassKey` | Passkey authentication records |
 | `Workflow` | Workflow definitions |
 
@@ -63,6 +64,7 @@ directly in chain, module, or endpoint code.
 | `MessageOper` | `oper/message.py` |
 | `PluginDataOper` | `oper/plugindata.py` |
 | `PluginIdentityOper` | `oper/pluginidentity.py` |
+| `PluginInstanceOper` | `oper/plugininstance.py` |
 | `SiteOper` | `oper/site.py` |
 | `SubscribeHistoryOper` | `oper/subscribehistory.py` |
 | `SubscribeOper` | `oper/subscribe.py` |
@@ -88,6 +90,14 @@ Application owns use-case commands and persistence Protocols, but does not impor
 `app/db/adapters/`: adapters implement those Protocols with explicit Session,
 UnitOfWork and Oper objects. `app/startup/composition/` creates and injects the
 adapters; it does not retain reusable repository implementations.
+
+音乐识别的临时失败可在 `TransferPending.state=accepted` 且不存在计划、步骤、执行结果和历史回执时，
+以当前有效租约 CAS 写入 `execution_state=retry_wait`、到期时间及重试计数，并释放租约。
+这些重试字段也受原有总重试预算约束；它们不是文件操作已发生的证据。接纳恢复必须重新读取
+冻结的音乐范围，已规划任务则继续消费原检查点。人工重试零文件操作的音乐拒绝时，只能在同一事务内
+验证唯一成功步骤确为原检查点的 `planning/reject`，删除该内部拒绝步骤和旧 pending，再创建新准入；
+旧失败历史只解除旧任务映射，记录与独立结算回执不删除，避免留下无法维护的悬空任务关联。
+任何外部操作步骤或版本/租约冲突都禁止走这条重规划路径。
 
 ### Transaction ownership ratchet
 
@@ -279,6 +289,20 @@ it must be an absolute, existing directory — `ensure` raises
 `FileNotFoundError` before creating anything rather than leaving behind a
 database with neither tables nor a version stamp.
 
+Before the upgrade runs, `run_migrations` compares the revisions already
+stamped in the plugin database against the script tree shipped with the
+installed plugin version. A revision that tree cannot locate means the
+database was stamped by a newer build — the ordinary outcome of reinstalling
+an older version — and the host raises `PluginMigrationCompatibilityError`
+naming both the revision and the directory instead of letting Alembic fail
+with a bare `Can't locate revision`. The host never downgrades automatically:
+downgrade scripts normally drop tables and columns, so running them unattended
+would destroy whatever the user produced under the newer version, with no way
+back. Recovery is to install a plugin version whose migration tree contains
+that revision, or to have an administrator perform an explicit data migration.
+A database with no `alembic_version` table yet reports no revisions, so first
+creation is never blocked by this check.
+
 Models must inherit `app.sdk.database.plugin_declarative_base()`, which mints
 a fresh `MetaData` per call so a plugin's tables never collide with
 `app.db.base.Base.metadata` or with another plugin's same-named tables. At
@@ -345,6 +369,16 @@ configuration.set(SystemConfigKey.RssUrls, ["https://example.com/rss"])
 ```
 
 **Rule:** Never use raw string literals as `SystemConfig` keys. Always define a new `SystemConfigKey` enum entry first. Raw string key lookups are not searchable and cannot be refactored safely.
+
+**Rule:** Plugin configuration is not `SystemConfig`. A plugin instance's own settings
+live on its `PluginInstance` row (`plugininstance.config_data`) and are reached through
+the plugin configuration channel — `_PluginBase.get_config()` / `update_config()` for
+plugins, `PluginConfigStore` and the `PluginStorage` instance-config ports for the host.
+`SystemConfigOper` treats every key alike and holds no knowledge of plugins; it must
+never branch on a key's value. A plugin that reads or writes its own configuration
+directly through `SystemConfig` (for example under a `plugin.<PluginId>` key) is
+unsupported: such a key is an ordinary, unrelated `SystemConfig` row that the plugin
+configuration channel neither reads nor writes.
 
 ---
 
@@ -441,4 +475,4 @@ can be accepted only once without Application knowing the configured backend.
 - `settings.API_TOKEN` and other secret fields must not be included in log output or API responses.
 - The `config list --show-secrets` flag exists specifically to gate secret visibility in the CLI.
 
-*Last Updated: 2026-09-02*
+*Last Updated: 2026-09-13*

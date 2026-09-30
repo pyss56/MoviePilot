@@ -27,6 +27,8 @@ class BangumiConfigSnapshot:
     """Bangumi 模块一次配置 generation 使用的稳定网络快照。"""
 
     proxy: Any
+    proxy_enabled: bool = False
+    api_domain: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +59,11 @@ class BangumiModule(MediaAuxiliaryProviderMixin, _ModuleBase):
     Bangumi媒体信息匹配
     """
     auxiliary_media_source = MediaSource.Bangumi
-    CONFIG_WATCH = {"PROXY_HOST"}
+    CONFIG_WATCH = {
+        "PROXY_HOST",
+        "BANGUMI_PROXY_ENABLE",
+        "BANGUMI_API_DOMAIN",
+    }
 
     bangumiapi: BangumiApi = None
     scraper: MediaScraperHelper = None
@@ -67,14 +73,26 @@ class BangumiModule(MediaAuxiliaryProviderMixin, _ModuleBase):
         """
         初始化Bangumi客户端
         """
-        self._config = BangumiConfigSnapshot(proxy=get_runtime_setting('PROXY'))
-        self.bangumiapi = BangumiApi()
+        self._config = BangumiConfigSnapshot(
+            proxy=get_runtime_setting('PROXY'),
+            proxy_enabled=bool(
+                get_runtime_setting('BANGUMI_PROXY_ENABLE', False)
+            ),
+            api_domain=str(
+                get_runtime_setting('BANGUMI_API_DOMAIN', '') or ''
+            ),
+        )
+        self.bangumiapi = BangumiApi(
+            base_url=self._config.api_domain if self._config.proxy_enabled else '',
+        )
         self.scraper = MediaScraperHelper()
 
     def stop(self) -> None:
         """
         关闭Bangumi客户端
         """
+        # 请求缓存键已包含 API 地址，切换代理或域名后自然使用新键；这里不清缓存，
+        # 以免 Redis 缓存在每次重载和关闭时都被清空。
         if self.bangumiapi:
             self.bangumiapi.close()
 
@@ -82,7 +100,8 @@ class BangumiModule(MediaAuxiliaryProviderMixin, _ModuleBase):
         """
         测试模块连接性
         """
-        ret = RequestUtils(proxies=self._config.proxy).get_res("https://api.bgm.tv/")
+        api_url = self.bangumiapi.base_url if self.bangumiapi else "https://api.bgm.tv/"
+        ret = RequestUtils(proxies=self._config.proxy).get_res(api_url)
         if ret and ret.status_code == 200:
             return True, ""
         elif ret:

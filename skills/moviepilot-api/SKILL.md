@@ -1,6 +1,6 @@
 ---
 name: moviepilot-api
-version: 31
+version: 35
 description: >-
   Use this skill for MoviePilot product operations such as media search, torrent
   search, downloads, subscriptions, library checks, sites, storage, workflows,
@@ -23,24 +23,24 @@ allowed-api-operations: >-
   slash.list config.identifiers.get config.identifiers.update search.torrents search.results
   filter.builtin filter.custom filter.groups filter.custom.add filter.custom.update
   filter.custom.delete filter.group.add filter.group.update filter.group.delete plugin.data
-  config.system.get config.system.update slash.run music.recognize music.explore music.album.get
-  music.album.related music.artist.get music.artist.albums music.artist.related music.cache.get
-  music.cache.delete music.cache.clear system.versions system.update.status system.update.check
-  system.update.download system.restart system.update.install system.upgrade.dev
-  dashboard.media.statistics dashboard.storage dashboard.processes dashboard.system
-  dashboard.downloader scheduler.progress dashboard.transfer.statistics dashboard.cpu
-  dashboard.memory dashboard.network media.sources media.recognize_file media.cache.get
-  media.cache.delete media.cache.clear media.classification.fields media.classification.policy.get
-  media.classification.policy.validate media.classification.policy.preview
-  media.classification.policy.impact media.classification.policy.history
-  media.classification.policy.update media.classification.policy.rollback media.episode_groups
-  media.episode_group.seasons media.seasons search.title search.recommend subtitle.search.title
-  subtitle.search.media site.add site.delete site.auth.options site.authenticate
-  site.cookiecloud.sync site.cookie.set site.reset site.priorities.update site.userdata.refresh
-  site.userdata.latest site.category site.resource site.searchable site.rss site.statistics
-  site.statistic site.mapping site.supporting subscription.get subscription.find
-  subscription.delete_by_media subscription.status.update subscription.reset
-  subscription.search_all subscription.refresh subscription.metadata.refresh
+  config.system.list config.system.describe config.system.get config.system.update slash.run
+  music.recognize music.explore music.album.get music.album.related music.artist.get
+  music.artist.albums music.artist.related music.cache.get music.cache.delete music.cache.clear
+  system.versions system.update.status system.update.check system.update.download system.restart
+  system.update.install system.upgrade.dev dashboard.media.statistics dashboard.storage
+  dashboard.processes dashboard.system dashboard.downloader scheduler.progress
+  dashboard.transfer.statistics dashboard.cpu dashboard.memory dashboard.network media.sources
+  media.recognize_file media.cache.get media.cache.delete media.cache.clear
+  media.classification.fields media.classification.policy.get media.classification.policy.validate
+  media.classification.policy.preview media.classification.policy.impact
+  media.classification.policy.history media.classification.policy.update
+  media.classification.policy.rollback media.episode_groups media.episode_group.seasons
+  media.seasons search.title search.recommend subtitle.search.title subtitle.search.media site.add
+  site.delete site.auth.options site.authenticate site.cookiecloud.sync site.cookie.set site.reset
+  site.priorities.update site.userdata.refresh site.userdata.latest site.category site.resource
+  site.searchable site.rss site.statistics site.statistic site.mapping site.supporting
+  subscription.get subscription.find subscription.delete_by_media subscription.status.update
+  subscription.reset subscription.search_all subscription.refresh subscription.metadata.refresh
   subscription.history.delete subscription.user.list subscription.files
   subscription.execution.list subscription.execution.get subscription.execution.cancel
   subscription.share subscription.share.delete subscription.fork subscription.follow.list
@@ -57,10 +57,12 @@ allowed-api-operations: >-
   system.network.targets system.network.test system.module.list system.module.catalog
   system.module.settings system.module.test plugin.market.sync_wiki plugin.runtime.status
   plugin.history plugin.releases plugin.ratings plugin.rating plugin.rating.submit
-  plugin.statistics plugin.reset plugin.clone config.user.get config.public.get
-  system.usage.statistics plugin.folders.get plugin.folders.update plugin.folder.create
-  plugin.folder.update plugin.folder.delete plugin.folder.plugins.update
-  plugin.folder.plugin.assign plugin.folder.plugin.remove
+  plugin.statistics plugin.reset plugin.clone.restorable plugin.clone config.user.get
+  config.public.get system.usage.statistics plugin.folders.get plugin.folders.update
+  plugin.folder.create plugin.folder.update plugin.folder.delete plugin.folder.plugins.update
+  plugin.folder.plugin.assign plugin.folder.plugin.remove plugin.loglevel.get plugin.loglevel.set
+  plugin.loglevel.clear plugin.default_target.set plugin.default_target.clear
+  plugin.instance.set_enabled plugin.instance.purge
 ---
 
 # MoviePilot API
@@ -89,7 +91,9 @@ use a more specific skill or explain that the structured operation is unavailabl
 3. The selected category file already includes the shared body Models needed to
    construct its calls; do not load a second Models document.
 4. Build one gateway call with only declared fields. Preserve source-native
-   identifiers and use the documented pagination fields.
+   identifiers and use the documented pagination fields. Pass object and array
+   bodies as native JSON values, and pass null only when the selected operation
+   allows it. The only string body is the literal `"dev"` for `system.upgrade.dev`.
 5. Obtain confirmation for confirmation-protected or side-effecting operations,
    then execute the gateway call once.
 6. Inspect `success`, `execution_outcome`, errors, empty results, and collection
