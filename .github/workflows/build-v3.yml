@@ -139,8 +139,6 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: |
-            ${{ secrets.DOCKER_USERNAME }}/moviepilot
-            ${{ secrets.DOCKER_USERNAME }}/moviepilot-v3
             ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=${{ env.app_version }}
@@ -151,7 +149,6 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: |
-            ${{ secrets.DOCKER_USERNAME }}/moviepilot-v3t
             ghcr.io/${{ github.repository }}-v3t
           tags: |
             type=raw,value=${{ env.app_version }}
@@ -296,12 +293,6 @@ jobs:
       #     ignore-unfixed: true
       #     trivyignores: .trivyignore.yaml
       #     exit-code: 1
-
-      - name: Login DockerHub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Login GitHub Container Registry
         uses: docker/login-action@v4
