@@ -8,7 +8,11 @@ from typing import Any, Dict, Literal, Optional, Type, Union
 
 from pydantic import BaseModel, Field, PrivateAttr
 
-from app.agent.api.arguments import api_input_contract, canonical_api_arguments
+from app.agent.api.arguments import (
+    api_input_contract,
+    canonical_api_arguments,
+    route_flat_api_arguments,
+)
 from app.agent.api.executor import ApiExecutionContext, ApiExecutionError, MoviePilotApiExecutor
 from app.agent.policy.api import resolve_api_operation
 from app.agent.policy.contracts import ExecutionOutcome, PrincipalRole
@@ -142,8 +146,13 @@ class MoviePilotApiTool(MoviePilotTool):
         return deepcopy(_load_api_mcp_input_schema())
 
     def canonical_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        """用缓存的 operation 合同生成实际执行与持久指纹共用的参数。"""
-        validated = MoviePilotApiInput.model_validate(arguments).model_dump(mode="json")
+        """用缓存的 operation 合同生成实际执行与持久指纹共用的参数。
+
+        先把模型误放到顶层的字段归并到 path_params/query/body，再做严格校验，
+        避免平铺字段被 pydantic 静默丢弃后误报“缺少必需字段”。
+        """
+        routed = route_flat_api_arguments(arguments, _load_api_mcp_input_schema())
+        validated = MoviePilotApiInput.model_validate(routed).model_dump(mode="json")
         return canonical_api_arguments(validated, _load_api_mcp_input_schema())
 
     def get_operation_input_contract(self, operation_id: str) -> dict[str, Any]:

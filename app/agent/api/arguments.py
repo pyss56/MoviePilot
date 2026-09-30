@@ -15,6 +15,7 @@ _SCALAR_ADAPTERS = {
 }
 _MISSING = object()
 _CONTRACT_DESCRIPTION_MAX_CHARS = 180
+_API_TOP_LEVEL_FIELDS = {"operation_id", "path_params", "query", "body"}
 
 
 def _resolve_schema(schema: dict[str, Any], definitions: dict[str, Any]) -> dict[str, Any]:
@@ -209,6 +210,54 @@ def _normalize_value(value: Any, declaration: dict[str, Any], definitions: dict[
     if "enum" in schema and value not in schema["enum"]:
         raise ValueError("API 参数枚举值无效")
     return deepcopy(value)
+
+
+def route_flat_api_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """把 LLM 误放到请求顶层的参数归并到正确桶，避免被 pydantic 静默丢弃。
+
+    模型常把本应属于 path_params / query / body 的字段平铺在 operation_id
+    同一层，导致校验报“缺少必需字段/包含未声明字段”。这里按合同把平铺字段
+    自愈归位：命中声明的 path_params 属性名则进 path_params；GET 操作进 query；
+    写入操作进 body。
+    """
+    if not isinstance(arguments, dict):
+        return arguments
+    flat = {key: value for key, value in arguments.items() if key not in _API_TOP_LEVEL_FIELDS}
+    if not flat:
+        return arguments
+    operation_id = arguments.get("operation_id")
+    branch = next(
+        (
+            item
+            for item in schema.get("oneOf", [])
+            if isinstance(item, dict)
+            and item.get("properties", {}).get("operation_id", {}).get("const") == operation_id
+        ),
+        None,
+    )
+    path_param_names: set[str] = set()
+    if isinstance(branch, dict):
+        path_params = branch.get("properties", {}).get("path_params")
+        if isinstance(path_params, dict):
+            path_param_names = {name for name in path_params.get("properties", {}) if isinstance(name, str)}
+    routed = deepcopy(arguments)
+    route = resolve_api_route(str(operation_id or ""))
+    is_get = route is not None and route.method == "GET"
+    for key, value in flat.items():
+        if key in path_param_names:
+            bucket = routed.setdefault("path_params", {})
+            if isinstance(bucket, dict):
+                bucket[key] = value
+        elif is_get:
+            bucket = routed.setdefault("query", {})
+            if isinstance(bucket, dict):
+                bucket[key] = value
+        else:
+            bucket = routed.setdefault("body", {})
+            if isinstance(bucket, dict):
+                bucket[key] = value
+        routed.pop(key, None)
+    return routed
 
 
 def canonical_api_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
