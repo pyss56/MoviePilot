@@ -32,6 +32,7 @@ ALLOWED_ACTION_REFS = {
     "actions/upload-artifact@v7",
     "actions/download-artifact@v8",
     "docker://ghcr.io/infinitypacer/pr-review-runner:latest",
+    "aquasecurity/trivy-action@v0.36.0",
 }
 
 
@@ -183,18 +184,40 @@ def test_direct_url_audit_requirement_rejects_unlocked_source(tmp_path: Path) ->
 
 @pytest.mark.parametrize("path", (RELEASE_WORKFLOW, BETA_WORKFLOW))
 def test_release_builds_publish_both_architectures_directly(path: Path) -> None:
-    """正式版和 Beta 直接构建发布双架构产物，删除扫描专用候选流程。"""
+    """正式版与 Beta 的发布步骤必须直接推送产物，且发布步骤不含漏洞扫描专用候选流程。
+
+    Fork 的正式版仅发布 amd64 双变体（standard + free-threaded），扫描候选步骤不推送；
+    Beta 仍按上游约定发布 amd64 + arm64 双架构。
+    """
     workflow = _load_workflow(path)
     steps = workflow["jobs"]["Docker-build"]["steps"]
-    builds = [step for step in steps if step.get("uses") == "docker/build-push-action@v7"]
-    assert len(builds) == 2
-    for step in builds:
-        config = step["with"]
-        assert config["push"] is True
-        assert config["pull"] is True
-        assert set(config["platforms"].split()) == {"linux/amd64", "linux/arm64/v8"}
-        assert "cache-to" in config
-    assert all("trivy" not in step.get("uses", "") for step in steps)
+    publishes = [
+        step
+        for step in steps
+        if step.get("uses") == "docker/build-push-action@v7"
+        and step.get("with", {}).get("push") is True
+    ]
+    if path == BETA_WORKFLOW:
+        assert len(publishes) == 2
+        for step in publishes:
+            config = step["with"]
+            assert config["push"] is True
+            assert config["pull"] is True
+            assert set(config["platforms"].split()) == {"linux/amd64", "linux/arm64/v8"}
+            assert "cache-to" in config
+    else:
+        # Fork 发布：两个变体（standard + free-threaded）均仅推送 amd64，扫描候选步骤 pull/push 均关闭。
+        assert len(publishes) == 2
+        for step in publishes:
+            config = step["with"]
+            assert config["push"] is True
+            assert config["platforms"] == "linux/amd64"
+            assert "cache-from" in config
+    assert all(
+        "trivy" not in step.get("uses", "")
+        for step in steps
+        if step.get("with", {}).get("push") is True
+    )
 
 
 def test_workflows_follow_maintained_action_channels() -> None:
@@ -359,22 +382,24 @@ def test_publish_refreshes_base_and_preserves_build_cache() -> None:
     publish = _steps_by_name(workflow)["Publish multi-architecture image"]["with"]
     assert workflow["on"]["workflow_dispatch"] is None
     assert publish["push"] is True
-    assert publish["pull"] is True
-    assert "scope=moviepilot-v3-standard-docker," in publish["cache-to"]
+    assert publish["pull"] is False
+    assert "scope=moviepilot-v3-standard-docker-amd64" in publish["cache-from"]
 
 
 def test_release_publishes_free_threaded_image_with_separate_metadata_and_cache() -> None:
-    """free-threaded 发布必须使用 v3t 命名、参数和独立缓存。"""
+    """free-threaded 发布必须使用 v3t 命名、参数和独立（amd64）缓存。
+
+    Fork 仅构建 amd64，故只校验 amd64 缓存作用域。
+    """
     workflow = _load_workflow()
     indexed = _steps_by_name(workflow)
 
     metadata = indexed["Docker Meta free-threaded"]
     publish = indexed["Publish free-threaded multi-architecture image"]
 
-    assert "moviepilot-v3t" in metadata["with"]["images"]
+    assert "ghcr.io/${{ github.repository }}-v3t" in metadata["with"]["images"]
     assert "MOVIEPILOT_PYTHON_VARIANT=free-threaded" in publish["with"]["build-args"]
     assert "scope=moviepilot-v3t-docker-amd64" in publish["with"]["cache-from"]
-    assert "scope=moviepilot-v3t-docker-arm64" in publish["with"]["cache-from"]
 
 
 def test_release_publishes_version_and_latest_tags_for_both_image_variants() -> None:
@@ -396,8 +421,6 @@ def test_release_publishes_version_and_latest_tags_for_both_image_variants() -> 
     )
 
     standard_images = indexed["Docker Meta"]["with"]["images"]
-    assert "${{ secrets.DOCKER_USERNAME }}/moviepilot" in standard_images
-    assert "${{ secrets.DOCKER_USERNAME }}/moviepilot-v3" in standard_images
     assert "ghcr.io/${{ github.repository }}" in standard_images
 
 
