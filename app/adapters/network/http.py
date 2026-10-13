@@ -1125,6 +1125,76 @@ class RequestUtils:
             return response.text
 
 
+def _log_pool_timeout_diagnosis(
+    proxy: Optional[str],
+    url: str,
+    *,
+    transport: Optional[httpx2.AsyncBaseTransport] = None,
+    http2: bool = False,
+    verify: _VerifySetting = False,
+    trust_env: bool = True,
+    max_keepalive_connections: int = _DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+    max_connections: int = _DEFAULT_MAX_CONNECTIONS,
+    keepalive_expiry: int = _DEFAULT_KEEPALIVE_EXPIRY,
+) -> None:
+    """PoolTimeout 时把共享连接池的占用快照打到日志，定位是谁占着 40 槽。
+
+    仅做只读诊断，任何异常都吞掉，绝不影响主请求流程。聚合当前事件循环下
+    所有共享 transport 桶的闲置 keep-alive 连接（按 host 分布），给出"全进程
+    此刻被谁占着"的全貌，从而区分是闲置 keep-alive 占额还是真实活跃突发。
+    """
+    try:
+        # 优先用调用方已拿到的 transport；否则按相同配置取回共享桶
+        if transport is None:
+            transport = _get_shared_async_transport(
+                proxy=proxy,
+                verify=verify,
+                http2=http2,
+                trust_env=trust_env,
+                max_keepalive_connections=max_keepalive_connections,
+                max_connections=max_connections,
+                keepalive_expiry=keepalive_expiry,
+            )
+        try:
+            loop = asyncio.get_running_loop()
+            per_loop = _shared_async_transports.get(loop)
+        except RuntimeError:
+            per_loop = None
+        buckets: list = []
+        if per_loop:
+            for _key, t in per_loop.items():
+                real = t._wrapped if isinstance(t, _NonClosingTransportProxy) else t
+                pool = getattr(real, "_pool", None)
+                if pool is None:
+                    continue
+                limits = getattr(pool, "_limits", None)
+                conns = getattr(pool, "_connections", None)
+                idle_per_origin: dict = {}
+                if isinstance(conns, dict):
+                    for origin, items in conns.items():
+                        if items:
+                            idle_per_origin[str(origin)] = len(items)
+                buckets.append(
+                    (
+                        getattr(limits, "max_connections", "?"),
+                        getattr(limits, "max_keepalive_connections", "?"),
+                        getattr(limits, "keepalive_expiry", "?"),
+                        sum(idle_per_origin.values()),
+                        len(idle_per_origin),
+                        idle_per_origin,
+                    )
+                )
+        logger.warning(
+            "[连接池诊断] PoolTimeout！触发请求 host=%s proxy=%s | "
+            "共享连接池快照(限额max_conn/max_ka/ka_exp, 闲置总数, host数, 分布)=%s",
+            (httpx2.URL(url).host if url else "?"),
+            proxy,
+            buckets,
+        )
+    except Exception as exc:  # noqa: BLE001 - 诊断代码自身绝不能影响主流程
+        logger.debug("[连接池诊断] 诊断脚本自身异常：%s", exc)
+
+
 class AsyncRequestUtils:
     """
     异步HTTP请求工具类，提供异步HTTP请求的基本功能
@@ -1511,6 +1581,22 @@ class AsyncRequestUtils:
             if raise_exception:
                 raise
             return None
+        except httpx2.PoolTimeout:
+            # 连接池 40 槽被打满：打印当前各共享桶的闲置 keep-alive 分布以定位占用者
+            _log_pool_timeout_diagnosis(
+                self._proxies,
+                url,
+                transport=getattr(client, "_transport", None),
+                http2=http2,
+                verify=request_verify,
+                trust_env=self._trust_env,
+                max_keepalive_connections=self._max_keepalive_connections,
+                max_connections=self._max_connections,
+                keepalive_expiry=self._keepalive_expiry,
+            )
+            if raise_exception:
+                raise
+            return None
         except httpx2.RequestError:
             if raise_exception:
                 raise
@@ -1702,6 +1788,22 @@ class AsyncRequestUtils:
 
             try:
                 response = await _open_stream(self._verify, http2)
+            except httpx2.PoolTimeout:
+                # 连接池 40 槽被打满：打印当前各共享桶的闲置 keep-alive 分布以定位占用者
+                _log_pool_timeout_diagnosis(
+                    self._proxies,
+                    url,
+                    http2=http2,
+                    verify=self._verify,
+                    trust_env=self._trust_env,
+                    max_keepalive_connections=self._max_keepalive_connections,
+                    max_connections=self._max_connections,
+                    keepalive_expiry=self._keepalive_expiry,
+                )
+                if raise_exception:
+                    raise
+                yield None
+                return
             except _ASYNC_STALE_CONNECTION_ERRORS:
                 try:
                     response = await _open_stream(self._verify, http2)
