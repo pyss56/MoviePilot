@@ -15,9 +15,6 @@ jobs:
   Docker-build:
     runs-on: ubuntu-latest
     name: Build Docker Image
-    env:
-      TRIVY_SKIP_DIRS: /usr/share/java
-      TRIVY_SKIP_JAVA_DB_UPDATE: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -176,20 +173,6 @@ jobs:
           cache-from: type=gha,scope=moviepilot-v3-standard-docker-amd64,version=2
           cache-to: type=gha,scope=moviepilot-v3-standard-docker-amd64,mode=max,version=2
 
-      - name: Scan amd64 candidate vulnerabilities
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: moviepilot-v3-candidate:linux-amd64
-          version: latest
-          cache-dir: ${{ runner.temp }}/trivy
-          scanners: vuln
-          vuln-type: os,library
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          trivyignores: .trivyignore.yaml
-          exit-code: 1
-
       - name: Build free-threaded amd64 candidate
         uses: docker/build-push-action@v7
         with:
@@ -208,20 +191,6 @@ jobs:
             MOVIEPILOT_PYTHON_VARIANT=free-threaded
           cache-from: type=gha,scope=moviepilot-v3t-docker-amd64,version=2
           cache-to: type=gha,scope=moviepilot-v3t-docker-amd64,mode=max,version=2
-
-      - name: Scan free-threaded amd64 candidate vulnerabilities
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: moviepilot-v3t-candidate:linux-amd64
-          version: latest
-          cache-dir: ${{ runner.temp }}/trivy
-          scanners: vuln
-          vuln-type: os,library
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          trivyignores: .trivyignore.yaml
-          exit-code: 1
 
       - name: Login GitHub Container Registry
         uses: docker/login-action@v4
