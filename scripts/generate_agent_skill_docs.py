@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-MOVIEPILOT_API_SKILL_VERSION = "35"
+MOVIEPILOT_API_SKILL_VERSION = "54"
 
 
 DATABASE_TABLE_GUIDES: dict[str, tuple[str, str, str]] = {
@@ -332,6 +332,7 @@ def _render_api_docs() -> str:
                 f"### `{operation_id}`",
                 f"`{route.method} {route.path}`; policy effect: `{effect}`.",
                 f"Purpose: {description.split(' Method:', 1)[0].strip()}",
+                f"Identity scope: `{specs[operation_id].identity_scope.value}`; required role: `{specs[operation_id].required_role.value}`.",
             ]
         )
         collection_contract = branch.get("x-moviepilot-collection")

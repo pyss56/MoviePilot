@@ -66,6 +66,7 @@ def _missing(scope, item):
 
 
 def test_paged_search_keeps_new_missing_episodes_in_completion(subscription, monkeypatch):
+    """搜索中扩展总集数后，下载结算保留新缺集，检查阶段可先同步旧范围。"""
     scope = subscription
     target = SubscriptionSearchTarget(scope.initial, build_subscribe_meta(scope.initial), scope.media,
                                       _missing(scope, scope.initial), "tmdb:1")
@@ -76,6 +77,7 @@ def test_paged_search_keeps_new_missing_episodes_in_completion(subscription, mon
     monkeypatch.setattr(scope.chain, "get_sub_sites", lambda _subscribe: [1])
     calls = []
     def request(**params):
+        """搜索首轮后模拟用户扩展订阅范围。"""
         calls.append(params["page"])
         # 开始搜索后用户将总集数从 1 增加到 2。
         scope.current["value"] = replace(scope.current["value"], total_episode=2)
@@ -90,8 +92,57 @@ def test_paged_search_keeps_new_missing_episodes_in_completion(subscription, mon
     scope.download.download_single.assert_called_once()
     scope.finished.assert_not_called()
     assert _missing(scope, scope.current["value"])["tmdb:1"][1].episodes == [2]
-    for call in scope.chain._SubscribeChain__refresh_subscribe_progress_with_no_exists.call_args_list:
+    completion_calls = [
+        call for call in scope.chain._SubscribeChain__refresh_subscribe_progress_with_no_exists.call_args_list
+        if call.kwargs.get("scene") == "download"
+    ]
+    assert completion_calls
+    for call in completion_calls:
         assert call.kwargs["no_exists"]["tmdb:1"][1].episodes == [2]
+
+
+def test_whole_season_downloads_late_complete_pack_before_early_parts(subscription, monkeypatch):
+    """整季缺失的真实分页与下载选集链路只提交后页全集包，不抢跑前页散集。"""
+    scope = subscription
+    current = replace(scope.initial, total_episode=2, manual_total_episode=2)
+    scope.current["value"] = current
+    target = SubscriptionSearchTarget(current, build_subscribe_meta(current), scope.media,
+                                      _missing(scope, current), "tmdb:1")
+    assert target.missing["tmdb:1"][1].episodes == []
+    search = SearchChain()
+    monkeypatch.setattr(search, "_sync_indexers", lambda _sites: [{"id": 1, "name": "A"}])
+    monkeypatch.setattr(search, "get_search_page_size", lambda **_params: 100)
+    monkeypatch.setattr(search, "search_plugin_torrents", lambda **_params: [])
+    monkeypatch.setattr(scope.chain, "get_sub_sites", lambda _subscribe: [1])
+    calls = []
+
+    def download(*_args, **_params):
+        """下载副作用必须晚于真实末页，不因散集关闭证据提前执行。"""
+        assert calls == [0, 1, 2, 3]
+        return "hash"
+
+    scope.download.download_single.side_effect = download
+
+    def request(**params):
+        """两页散集后出现整季包，再以空页确认来源结束。"""
+        page = params["page"]
+        calls.append(page)
+        titles = {0: "Example Show S01E01", 1: "Example Show S01E02",
+                  2: "Example Show S01 Complete"}
+        items = [TorrentInfo(site=1, site_name="A", title=titles[page],
+                             enclosure=f"https://site.example/download?id={page}", pri_order=100)] if page < 3 else []
+        report_site_search_outcome(attempted=True, outcome="success")
+        report_site_search_page(raw_count=len(items))
+        return items
+
+    monkeypatch.setattr(search, "search_site_torrents", request)
+    _process_paged_subscription(scope.chain, current, search, target, SystemConfigKey.SubscribeFilterRuleGroups, None)
+    assert calls == [0, 1, 2, 3]
+    scope.download.download_single.assert_called_once()
+    context = scope.download.download_single.call_args.kwargs["context"]
+    assert context.torrent_info.title == "Example Show S01 Complete"
+    assert context.selected_episodes is None
+    assert scope.current["value"].lack_episode == 0
 
 
 def test_ready_batch_uses_original_partial_pack_selection_and_returns_full_missing(subscription):

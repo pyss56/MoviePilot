@@ -1,5 +1,5 @@
 from dataclasses import fields
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from pydantic import Field
 
@@ -7,8 +7,6 @@ from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.domain.context import Context as DownloadContext
 from app.domain.context import MediaInfo as DownloadMediaInfo
-from app.domain.context import MusicInfo as DownloadMusicInfo
-from app.domain.context import TorrentInfo as DownloadTorrentInfo
 from app.domain.meta.metabase import MetaBase
 from app.domain.meta.metamusic import MetaMusic
 from app.domain.metainfo import MetaInfo
@@ -17,7 +15,7 @@ from app.runtime.stop import runtime_stop_state
 from app.schemas.context import Context as WorkflowTorrentContext
 from app.schemas.types import MediaType
 from app.schemas.workflow import ActionContext, ActionParams, DownloadTask
-from app.workflow.actions import BaseAction
+from app.workflow.actions import BaseAction, domain_media_info_from_dict, domain_torrent_info_from_dict
 
 
 class AddDownloadParams(ActionParams):
@@ -62,9 +60,7 @@ class AddDownloadAction(BaseAction):
         """
         params = AddDownloadParams(**params)
         _started = False
-        for t in context.torrents:
-            if runtime_stop_state.is_workflow_stopped(workflow_id):
-                break
+        for t in self._iter_resources(workflow_id, context):
             # 检查缓存
             cache_key = f"{t.torrent_info.site}-{t.torrent_info.title}"
             if self.check_cache(workflow_id, cache_key):
@@ -131,28 +127,45 @@ class AddDownloadAction(BaseAction):
         self.job_done(f"已添加 {len(self._added_downloads)} 个下载任务")
         return context
 
+    def _iter_resources(
+            self, workflow_id: int, context: ActionContext,
+    ) -> Iterator[WorkflowTorrentContext | DownloadContext]:
+        """恢复节点输出字典并保留实时领域对象；历史文本提示重跑并保留动作失败状态。"""
+        for resource in context.torrents or []:
+            if runtime_stop_state.is_workflow_stopped(workflow_id):
+                break
+            if isinstance(resource, str):
+                # 旧版文本无法可靠还原，避免把丢失资源报告为成功。
+                self._has_error = True
+                logger.warning("工作流历史资源已保存为文本，无法恢复，跳过该资源；请重新运行工作流获取资源")
+                continue
+            if isinstance(resource, dict):
+                resource = WorkflowTorrentContext.model_validate(resource)
+            yield resource
+
     @staticmethod
-    def _to_domain_context(context: WorkflowTorrentContext) -> DownloadContext:
-        """把工作流传输模型转换为下载链使用的领域上下文和媒体类型。"""
+    def _to_domain_context(
+            context: WorkflowTorrentContext | DownloadContext | dict[str, Any],
+    ) -> DownloadContext:
+        """复用 RSS 领域上下文，或把恢复的节点输出字典及传输模型还原为下载链领域对象。"""
+        if isinstance(context, dict):
+            return AddDownloadAction._to_domain_context(WorkflowTorrentContext.model_validate(context))
         if context.media_info is None or context.torrent_info is None:
             raise ValueError("工作流下载上下文缺少媒体或种子信息")
+
+        if isinstance(context, DownloadContext):
+            return context
 
         context_data: dict[str, Any] = context.model_dump()
         media_data = context_data.get("media_info")
         if not isinstance(media_data, dict):
             raise ValueError("工作流下载上下文缺少有效媒体信息")
-        domain_media_info: DownloadMediaInfo | DownloadMusicInfo
-        if media_data.get("type") == MediaType.MUSIC.value:
-            domain_media_info = DownloadMusicInfo.from_dict(media_data)
-        else:
-            domain_media_info = DownloadMediaInfo()
-            domain_media_info.from_dict(media_data)
+        domain_media_info = domain_media_info_from_dict(media_data)
 
         torrent_data = context_data.get("torrent_info")
         if not isinstance(torrent_data, dict):
             raise ValueError("工作流下载上下文缺少有效种子信息")
-        domain_torrent_info = DownloadTorrentInfo()
-        domain_torrent_info.from_dict(torrent_data)
+        domain_torrent_info = domain_torrent_info_from_dict(torrent_data)
 
         domain_meta_info: MetaBase | None = None
         meta_data = context_data.get("meta_info")

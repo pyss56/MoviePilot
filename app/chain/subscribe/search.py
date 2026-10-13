@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional, cast
 from uuid import uuid4
 
 from app.application.configuration import get_configured_system_config
+from app.application.subscription.activity import current_activity_run, subscription_activity_scope
 from app.application.subscription.contract import (
     SubscriptionRepository,
     SubscriptionSnapshot,
@@ -29,6 +30,7 @@ from app.application.subscription.observability import (
     batch_finished_count,
     batch_progress_text,
     inline_search_result,
+    subscription_log_scope,
 )
 from app.application.subscription.query import SubscriptionQueryService, subscription_search_due
 from app.application.subscription.sitebudget import (
@@ -115,9 +117,11 @@ def _process_paged_subscription(owner: _SubscribeOwnerBase, subscribe: Subscript
         execution_context.incremental_search = True
 
     def submit(contexts: list[Context], ready: set[str]) -> set[str]:
+        """仅下载已就绪目标，并记录本页候选和实际提交结果。"""
         _ensure_execution_active(execution_context)
         if execution_context:
             execution_context.report_phase("preparing")
+        logger.scoped_info(f"本页可选资源 {len(contexts)} 个，开始检查下载条件")
         downloads, lefts = owner._SubscribeChain__download_best_version_with_full_pack_first(
             contexts=contexts, no_exists=deepcopy(target.missing),
             subscribe=subscribe, mediakey=target.media_key, username=subscribe.username,
@@ -125,6 +129,11 @@ def _process_paged_subscription(owner: _SubscribeOwnerBase, subscribe: Subscript
             source=owner.get_subscribe_source_keyword(subscribe), execution_context=execution_context,
             eligible_targets=ready,
         )
+        activity = current_activity_run()
+        if activity:
+            for download in downloads or []:
+                activity.resource(download, "submitted")
+        logger.scoped_info(f"本页新增下载 {len(downloads or [])} 个")
         if target.media.type == MediaType.MOVIE:
             settled = ready if downloads else set()
         else:
@@ -818,6 +827,26 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
         execution_context: Optional[SubscriptionExecutionContext] = None,
     ) -> Optional[SubscriptionSnapshot]:
         """处理单个订阅，并返回下载后重新读取的状态快照。"""
+        with subscription_log_scope(subscribe.id, "inline"), subscription_activity_scope(
+            getattr(self, "subscription_activity", None), subscribe, "search",
+            getattr(execution_context, "source", None) or "automatic",
+            getattr(execution_context, "task_id", None),
+        ):
+            logger.scoped_info(f"开始搜索订阅：{subscribe.name}")
+            result = self._search_subscription(subscribe, searchchain, execution_context)
+            if result is not None:
+                logger.scoped_info("本轮搜索结束，订阅继续等待")
+            else:
+                logger.scoped_info("本轮搜索结束，订阅状态已更新；请以完成记录为准")
+            return result
+
+    def _search_subscription(
+        self,
+        subscribe: SubscriptionSnapshot,
+        searchchain: Optional[SearchChain],
+        execution_context: Optional[SubscriptionExecutionContext] = None,
+    ) -> Optional[SubscriptionSnapshot]:
+        """在订阅日志作用域内执行既有搜索、下载和完成判定。"""
         _ensure_execution_active(execution_context)
         # 站点补查属于同一轮搜索，不能反复推迟下一轮健康站点的完整检查。
         if execution_context is None or not execution_context.resuming_sites:
@@ -892,6 +921,10 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
             source=self.get_subscribe_source_keyword(subscribe),
             execution_context=execution_context,
         )
+        activity = current_activity_run()
+        if activity:
+            for download in downloads or []:
+                activity.resource(download, "submitted")
         current = self.subscription_repository.get(subscribe.id)
         if current:
             self.finish_subscribe_or_not(
@@ -912,8 +945,11 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
     ) -> list[Any]:
         """过滤不满足洗版范围或优先级的搜索候选，并释放原结果列表。"""
         matched = []
+        activity = current_activity_run()
         try:
             for context in contexts:
+                if activity:
+                    activity.resource(context, "rejected", "不符合洗版范围或升级优先级")
                 if runtime_stop_state.is_system_stopped:
                     break
                 torrent_meta = context.meta_info
@@ -953,6 +989,8 @@ class SubscribeSearchOwner(_SubscribeSearchQueueOwner):
                 if subscribe.episode_group:
                     media.episode_group = subscribe.episode_group
                 matched.append(context)
+                if activity:
+                    activity.resource(context, "qualified")
         finally:
             contexts.clear()
         return matched
