@@ -125,7 +125,7 @@ Identity scope: `admin`; required role: `system_admin`.
 Purpose: List active configured sites supporting one exact media type.
 Identity scope: `admin`; required role: `system_admin`.
 - `response`: `data` remains a list; omitting both `page` and `count` keeps the complete legacy result. `collection.result_count` reports the returned items and `collection.total_count` reports the exact pre-pagination total. For counts or summaries, send `page=1,count=1`, read `collection.total_count`, and do not fall back to a database query because the item preview was truncated.
-- `path_params`: `media_type*` (string): MoviePilot media type used to filter recommendations or rule groups.
+- `path_params`: `media_type*` (string(movie, tv, music)): MoviePilot media type used to filter recommendations or rule groups. Agent-facing MediaType keys: movie, tv, music (map the recognition result `type` as 电影→movie, 电视剧→tv; if documented under path_params, nest it there; never use the recognition `type` field name or invent names such as `type_name`).
 - `query`: `count` (integer|null): Optional page size for a legacy full-list endpoint. Supplying page or count activates pagination; an omitted count then uses 50.; `page` (integer|null): Optional one-based page for a legacy full-list endpoint. Omit both page and count to keep the original unpaginated full result.
 - `body`: none
 - **Agent note:** `media_type` is a **path** parameter and MUST be nested under `path_params`. Never flatten it to the top level or place it inside `query`, otherwise the gateway rejects with `invalid_input`.

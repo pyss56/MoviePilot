@@ -261,6 +261,36 @@ def _field_suffix(schema: Mapping[str, Any]) -> str:
     return f"; {'; '.join(suffix)}" if suffix else ""
 
 
+_MEDIA_TYPE_FIELDS = {"mtype", "media_type"}
+_MEDIA_TYPE_AGENT_VALUES = "movie, tv, music"
+
+
+def _augment_field_type(name: str, field_type: str) -> str:
+    """Surface the Agent-facing MediaType keys for media-type fields.
+
+    The OpenAPI schema only marks these as a bare `string`; the API actually
+    accepts the MediaType agent keys (see MediaType.from_agent), so the contract
+    must name them explicitly.
+    """
+    if name in _MEDIA_TYPE_FIELDS:
+        nullable = "|null" if "null" in field_type else ""
+        return f"string({_MEDIA_TYPE_AGENT_VALUES}){nullable}"
+    return field_type
+
+
+def _augment_field_description(name: str, description: str) -> str:
+    """Add contract guidance the raw schema cannot express."""
+    if name in _MEDIA_TYPE_FIELDS:
+        note = (
+            " Agent-facing MediaType keys: movie, tv, music (map the recognition "
+            "result `type` as 电影→movie, 电视剧→tv; if documented under path_params, "
+            "nest it there; never use the recognition `type` field name or invent "
+            "names such as `type_name`)."
+        )
+        return (description.rstrip() + note).strip()
+    return description
+
+
 def _schema_fields(
     schema: Mapping[str, Any],
     definitions: Mapping[str, Any],
@@ -277,12 +307,15 @@ def _schema_fields(
     for name, raw_schema in properties.items():
         if not isinstance(raw_schema, Mapping):
             continue
+        field_name = str(name)
         fields.append(
             (
-                str(name),
-                _schema_type(raw_schema, definitions),
-                str(raw_schema.get("description") or ""),
-                str(name) in required,
+                field_name,
+                _augment_field_type(field_name, _schema_type(raw_schema, definitions)),
+                _augment_field_description(
+                    field_name, str(raw_schema.get("description") or "")
+                ),
+                field_name in required,
             )
         )
     return fields
