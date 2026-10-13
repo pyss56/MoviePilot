@@ -128,6 +128,7 @@ Identity scope: `admin`; required role: `system_admin`.
 - `path_params`: `media_type*` (string): MoviePilot media type used to filter recommendations or rule groups.
 - `query`: `count` (integer|null): Optional page size for a legacy full-list endpoint. Supplying page or count activates pagination; an omitted count then uses 50.; `page` (integer|null): Optional one-based page for a legacy full-list endpoint. Omit both page and count to keep the original unpaginated full result.
 - `body`: none
+- **Agent note:** `media_type` is a **path** parameter and MUST be nested under `path_params`. Never flatten it to the top level or place it inside `query`, otherwise the gateway rejects with `invalid_input`.
 
 ### `site.statistic`
 `GET /api/v1/site/statistic/{site_url}`; policy effect: `safe_read`.

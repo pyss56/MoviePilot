@@ -38,14 +38,15 @@ Identity scope: `bound_user`; required role: `user`.
 - `path_params`: `media_id*` (string): Source-native media ID. Always pair it with the exact media_source returned by search.
 - `query`: `area` (string|null; default `title`): Optional region filter applied by the torrent search workflow.; `count` (integer|null): Optional page size for a legacy full-list endpoint. Supplying page or count activates pagination; an omitted count then uses 50.; `include_candidates` (boolean; default `False`): Include unconfirmed music resources and related albums for manual review. Defaults to false; candidates have no target media identity and must not be used for automatic download.; `media_source*` (MediaSource): Metadata source identifier. Preserve the exact value returned with media_id.; `mtype` (string|null): MoviePilot media type or subscription-history category required by the operation.; `music_type` (string|null): Music identity level: recording, album, or artist where supported.; `page` (integer|null): Optional one-based page for a legacy full-list endpoint. Omit both page and count to keep the original unpaginated full result.; `season` (string|null): Season number used by the media, search, subscription, or transfer operation.; `sites` (string|null): Exact site IDs included in the search or subscription scope.
 - `body`: none
+- **Agent note:** `media_id` is a **path** parameter and MUST be nested under `path_params`. Never flatten it to the top level or place it inside `query`, otherwise the gateway rejects with `invalid_input`. The same rule applies to every `*`-marked path parameter across this document set (`media_type`, `site_id`, …).
 
-### 识别结果选择与空结果重试（Agent 必读）
-- `media.recognize` / `media.search` 返回多条候选时，**以「标题与用户请求一致 + `type`（电影/电视剧）匹配」为选取依据，不要机械地取第一条或任意一条而不比对**。若第一条恰好精确匹配且 type 正确，可直接使用；多条都接近时优先取排序靠前/热度更高者。
-- `search.torrents` 必须带 `media_source` + `media_id`，且二者取自**同一条**识别结果，不要混用不同候选的 `source`/`id`。
-- 若 `search.torrents` 返回 `success=false` 或 `data` 为空：
-  - **不要重复完全相同的调用**（会被编排器熔断，报「重复尝试且没有取得进展」）；
-  - 改用同一次识别里**与用户请求最相关的其他候选** `media_id` 重试（不要求严格顺序遍历，按标题/type 接近度挑），或退回 `search.title` 用用户原始标题关键词搜索；
-  - 仅当候选列表与 `search.title` 都试过仍为空，才如实向用户报告「未搜索到任何资源」。
+### Candidate Selection and Empty-Result Retries (Agent Must-Read)
+- When `media.recognize` / `media.search` returns multiple candidates, select based on **title matching the user's request AND `type` (movie/series) matching**; do not mechanically pick the first or an arbitrary candidate without comparison. If the first candidate happens to exactly match and its type is correct, you may use it directly; when several are close, prefer the higher-ranked / more popular one.
+- `search.torrents` must be called with `media_source` + `media_id`, and both must come from the **same** recognition result — do not mix `source`/`id` from different candidates.
+- If `search.torrents` returns `success=false` or `data` is empty:
+  - **Do not repeat the exact same call** (the orchestrator will trip its circuit breaker and report "repeated attempt with no progress").
+  - Retry by switching to **another candidate `media_id` most relevant to the user's request** from the same recognition (strict sequential traversal is not required — pick by title/type closeness), or fall back to `search.title` using the user's original title keywords.
+  - Only after both the candidate list and `search.title` have been tried and are still empty should you honestly report to the user "no resources found".
 
 ## Body Models
 
