@@ -108,7 +108,7 @@ Purpose: Browse torrent resources from one configured site with category and key
 Identity scope: `admin`; required role: `system_admin`.
 - `response`: `data` remains a list and `collection.result_count` reports the returned items. `collection.total_count` is omitted because this endpoint or its upstream source does not expose a total.
 - `path_params`: `site_id*` (integer): Persistent site ID returned by site.list.
-- `query`: `cat` (string|null): Exact site category identifier returned by site.category.; `keyword` (string|null): Case-insensitive substring used to discover settings or filter storage entries.; `mtype` (string|null): MoviePilot media type or subscription-history category required by the operation.; `page` (integer|null; default `0`): One-based result page number.
+- `query`: `cat` (string|null): Exact site category identifier returned by site.category.; `keyword` (string|null): Case-insensitive substring used to discover settings or filter storage entries.; `mtype` (string(movie, tv, music)|null): MoviePilot media type or subscription-history category required by the operation. Agent-facing MediaType keys: movie, tv, music (map the recognition result `type` as 电影→movie, 电视剧→tv; if documented under path_params, nest it there; never use the recognition `type` field name or invent names such as `type_name`).; `page` (integer|null; default `0`): One-based result page number.
 - `body`: none
 
 ### `site.rss`
